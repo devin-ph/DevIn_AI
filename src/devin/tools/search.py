@@ -51,7 +51,7 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
 
 def _search_duckduckgo(query: str, max_results: int) -> str:
     """Primary search using DuckDuckGo (FREE, no API key needed)."""
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 
     results = []
     with DDGS() as ddgs:
