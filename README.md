@@ -26,7 +26,7 @@ DevIn is an autonomous AI agent designed to streamline CLI and automate software
 
 DevIn aims to enhance developer productivity by intelligently automating various coding workflows, from understanding requirements and planning solutions to executing changes and validating outcomes.
 
-![Multi-Agents](assets/multi-agent.png)
+![Multi-Agents](assets/multi_agent.png)
 
 ## Getting Started
 
