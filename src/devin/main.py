@@ -103,12 +103,14 @@ def print_banner():
     """Print the DevIn startup banner."""
     banner = Text()
     banner.append("╔══════════════════════════════════════════════════════╗\n", style="cyan")
+    banner.append("║                                                      ║\n", style="cyan")
     banner.append("║", style="cyan")
-    banner.append("   D e v I n - Your personal Developer Intelligence   ", style="bold white")
+    banner.append("     DevIn - Your personal Developer Intelligence     ", style="bold white")
     banner.append("║\n", style="cyan")
     banner.append("║", style="cyan")
     banner.append("                 Autonomous AI Agent                  ", style="dim white")
     banner.append("║\n", style="cyan")
+    banner.append("║                                                      ║\n", style="cyan")
     banner.append("╚══════════════════════════════════════════════════════╝", style="cyan")
     console.print(banner)
     console.print(
