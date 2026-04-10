@@ -1,7 +1,9 @@
 # Tests for DevIn agent state and prompts.
 
+from langchain_core.messages import AIMessage
+from devin.agent.graph import architect_should_continue
+from devin.agent.prompts import get_architect_prompt, get_editor_prompt
 from devin.agent.state import AgentState
-from devin.agent.prompts import get_system_prompt
 
 
 class TestAgentState:
@@ -27,16 +29,30 @@ class TestAgentState:
 class TestPrompts:
     """Tests for the prompt generation."""
 
-    def test_system_prompt_contains_identity(self):
-        prompt = get_system_prompt()
+    def test_architect_prompt_contains_identity(self):
+        prompt = get_architect_prompt()
         assert "DevIn" in prompt
-        assert "ReAct" in prompt
+        assert "Architect" in prompt
 
-    def test_system_prompt_contains_rules(self):
-        prompt = get_system_prompt()
-        assert "Safety" in prompt
-        assert "confirmation" in prompt.lower()
+    def test_architect_prompt_contains_rules(self):
+        prompt = get_architect_prompt()
+        assert "RULES:" in prompt
+        assert "read-only tools" in prompt
 
-    def test_system_prompt_has_timestamp(self):
-        prompt = get_system_prompt()
+    def test_architect_prompt_has_timestamp(self):
+        prompt = get_architect_prompt()
+        assert "Current Time:" in prompt
+
+    def test_editor_prompt_contains_identity(self):
+        prompt = get_editor_prompt()
+        assert "DevIn" in prompt
+        assert "Editor" in prompt
+
+    def test_editor_prompt_contains_rules(self):
+        prompt = get_editor_prompt()
+        assert "EXECUTE" in prompt
+        assert "active tools" in prompt
+
+    def test_editor_prompt_has_timestamp(self):
+        prompt = get_editor_prompt()
         assert "Current Time:" in prompt

@@ -9,7 +9,6 @@ class TestSettings:
     """Tests for the settings module."""
 
     def test_default_values(self):
-        # Must pass env_file=None to ignore local .env file in tests
         settings = DevinSettings(
             _env_file=None,
             google_api_key="",
