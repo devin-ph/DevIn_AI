@@ -1,1 +1,1 @@
-# DevIn — Jarvis-like Autonomous AI Assistant
+# DevIn — Autonomous AI Assistant

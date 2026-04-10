@@ -15,6 +15,16 @@ from __future__ import annotations
 import json
 import logging
 import sys
+
+# Force UTF-8 rendering on Windows terminals to prevent rich crashes
+if hasattr(sys.stdout, 'reconfigure'):
+    if sys.stdout.encoding != 'utf-8':
+        sys.stdout.reconfigure(encoding='utf-8')
+    if sys.stderr.encoding != 'utf-8':
+        sys.stderr.reconfigure(encoding='utf-8')
+
+logger = logging.getLogger("devin")
+
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,14 +102,14 @@ class InteractionLogger:
 def print_banner():
     """Print the DevIn startup banner."""
     banner = Text()
-    banner.append("╔══════════════════════════════════════════╗\n", style="cyan")
+    banner.append("╔══════════════════════════════════════════════════════╗\n", style="cyan")
     banner.append("║", style="cyan")
-    banner.append("          ⚡ D E V I N ⚡               ", style="bold white")
+    banner.append("   D e v I n - Your personal Developer Intelligence   ", style="bold white")
     banner.append("║\n", style="cyan")
     banner.append("║", style="cyan")
-    banner.append("    Autonomous AI Assistant v0.1.0       ", style="dim white")
+    banner.append("                 Autonomous AI Agent                  ", style="dim white")
     banner.append("║\n", style="cyan")
-    banner.append("╚══════════════════════════════════════════╝", style="cyan")
+    banner.append("╚══════════════════════════════════════════════════════╝", style="cyan")
     console.print(banner)
     console.print(
         '  Type your message to chat. Type [bold cyan]/help[/] for commands.\n',
@@ -184,7 +194,9 @@ def handle_slash_command(
                     content = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
                     console.print(f"    [devin.user]You:[/] {content}")
                 elif isinstance(msg, AIMessage) and not msg.tool_calls:
-                    content = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+                    # Filter thoughts from history view
+                    clean_content = re.sub(r'<thought>.*?</thought>', '', msg.content, flags=re.DOTALL).strip()
+                    content = clean_content[:80] + "..." if len(clean_content) > 80 else clean_content
                     console.print(f"    [cyan]DevIn:[/] {content}")
             console.print()
 
@@ -227,7 +239,6 @@ def handle_slash_command(
 def run_cli():
     """Run the DevIn interactive CLI."""
     from devin.agent.graph import build_graph
-    from devin.agent.prompts import get_system_prompt
     from devin.tools.registry import create_default_registry
 
     # Initialize
@@ -235,14 +246,12 @@ def run_cli():
 
     try:
         registry = create_default_registry()
-        console.print(f"  [devin.system]✅ Loaded {registry.count} tools: {registry.get_tool_names()}[/]")
     except Exception as e:
         print_error(f"Failed to load tools: {e}")
         return
 
     try:
         agent = build_graph(registry=registry)
-        console.print("  [devin.system]✅ Agent graph compiled[/]")
     except Exception as e:
         print_error(f"Failed to create agent: {e}")
         console.print("  [dim]Make sure your API keys are set in .env[/]")
@@ -253,7 +262,6 @@ def run_cli():
     interaction_logger = InteractionLogger()
     conversation: list = []
     debug_mode = False
-    system_msg = SystemMessage(content=get_system_prompt())
 
     while True:
         try:
@@ -283,8 +291,7 @@ def run_cli():
             user_message = HumanMessage(content=user_input)
             conversation.append(user_message)
 
-            # Build full message list with system prompt
-            full_messages = [system_msg] + conversation
+            full_messages = conversation
 
             console.print()  # spacing
 
@@ -292,41 +299,85 @@ def run_cli():
             try:
                 final_response = ""
                 iteration = 0
+                live_render = None
 
-                for event in agent.stream(
+                import re
+
+                def clean_thought_blocks(text: str) -> str:
+                    # Remove anything inside <thought> tags (non-greedy)
+                    return re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL).strip()
+
+                from langchain_core.messages import AIMessageChunk
+                for mode, payload in agent.stream(
                     {"messages": full_messages, "iteration_count": 0},
-                    stream_mode="updates",
+                    stream_mode=["messages", "updates"],
                 ):
-                    # Each event is a dict of {node_name: state_update}
-                    for node_name, state_update in event.items():
-                        if node_name == "reason":
-                            iteration += 1
-                            messages = state_update.get("messages", [])
-                            for msg in messages:
-                                if isinstance(msg, AIMessage):
-                                    if msg.tool_calls:
-                                        print_thinking(iteration)
-                                        for tc in msg.tool_calls:
-                                            print_tool_call(tc["name"], tc.get("args", {}))
-                                    elif msg.content:
-                                        if isinstance(msg.content, str):
-                                            final_response = msg.content
-                                        elif isinstance(msg.content, list):
-                                            final_response = "".join(
-                                                item.get("text", "") if isinstance(item, dict) else str(item)
-                                                for item in msg.content
-                                            )
+                    if mode == "messages":
+                        chunk, metadata = payload
+                        if metadata.get("langgraph_node") in ["architect", "editor", "validator"] and isinstance(chunk, AIMessageChunk):
+                            if not chunk.tool_call_chunks and not chunk.tool_calls:
+                                content = chunk.content
+                                if isinstance(content, list):
+                                    content = "".join(
+                                        item.get("text", "") if isinstance(item, dict) else str(item)
+                                        for item in content
+                                    )
+                                if content:
+                                    final_response += content
+                                    
+                                    # Filter thoughts for display
+                                    display_text = clean_thought_blocks(final_response)
+                                    
+                                    if live_render is None:
+                                        console.print()
+                                        live_render = Live(
+                                            Panel(Markdown(display_text or "🧠 *Thinking...*"), title="[bold cyan]DevIn[/]", border_style="cyan", padding=(1, 2)),
+                                            console=console,
+                                            refresh_per_second=15,
+                                            transient=False,
+                                        )
+                                        live_render.start()
+                                    
+                                    live_render.update(Panel(Markdown(display_text or "🧠 *Thinking...*"), title="[bold cyan]DevIn[/]", border_style="cyan", padding=(1, 2)))
 
-                        elif node_name == "act":
-                            messages = state_update.get("messages", [])
-                            for msg in messages:
-                                if isinstance(msg, ToolMessage):
-                                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                                    print_tool_result(content)
+                    elif mode == "updates":
+                        if live_render is not None:
+                            live_render.stop()
+                            live_render = None
 
-                # Display final response
+                        for node_name, state_update in payload.items():
+                            if node_name in ["architect", "editor", "validator"]:
+                                if node_name == "architect":
+                                    # We don't necessarily increment iteration for architect if we track total across graph,
+                                    # but let's just increment to show progress.
+                                    iteration += 1
+                                    
+                                messages = state_update.get("messages", [])
+                                for msg in messages:
+                                    if isinstance(msg, AIMessage):
+                                        if msg.tool_calls:
+                                            # Differentiate node thinking phases
+                                            if node_name == "architect":
+                                                console.print(f"\n[cyan]🧠 Architect Planning (Iteration {iteration})...[/]")
+                                            elif node_name == "validator":
+                                                console.print(f"\n[green]🔍 Validator Reviewing...[/]")
+                                            else:
+                                                console.print(f"\n[magenta]⚡ Editor Executing...[/]")
+                                                
+                                            for tc in msg.tool_calls:
+                                                print_tool_call(tc["name"], tc.get("args", {}))
+                            
+                            elif node_name in ["architect_tools", "editor_tools"]:
+                                messages = state_update.get("messages", [])
+                                for msg in messages:
+                                    if isinstance(msg, ToolMessage):
+                                        c = msg.content if isinstance(msg.content, str) else str(msg.content)
+                                        print_tool_result(c)
+
+                if live_render is not None:
+                    live_render.stop()
+
                 if final_response:
-                    print_response(final_response)
                     conversation.append(AIMessage(content=final_response))
                     interaction_logger.log("assistant", final_response, {"iterations": iteration})
                 else:
