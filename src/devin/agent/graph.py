@@ -30,177 +30,220 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
+from langchain_core.tools import tool
 
 from devin.agent.llm_provider import create_llm
-from devin.agent.prompts import get_system_prompt
+from devin.agent.prompts import get_architect_prompt, get_editor_prompt
 from devin.agent.state import AgentState
 from devin.settings import settings
 from devin.tools.registry import ToolRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
 
+import subprocess
+import os
 
-def should_continue(state: AgentState) -> Literal["act", "__end__"]:
+@tool
+def delegate_to_editor(instructions: str) -> str:
     """
-    Routing function: decide whether to call tools or finish.
-
-    Returns "act" if the LLM wants to call a tool.
-    Returns END if the LLM gave a final response (no tool calls).
+    Delegate the execution of tasks to the Editor sub-agent.
+    Provide highly detailed, step-by-step instructions for what the Editor needs to do.
     """
-    messages = state["messages"]
-    last_message = messages[-1]
-
-    # Check iteration cap
-    iteration = state.get("iteration_count", 0)
-    if iteration >= settings.devin_max_iterations:
-        logger.warning(f"Hit max iterations ({settings.devin_max_iterations}). Forcing stop.")
-        return "__end__"
-
-    # If the LLM decided to use a tool, route to the act node
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "act"
-
-    # Otherwise, the LLM gave a final response
-    return "__end__"
-
-
-def reason_node(state: AgentState) -> dict[str, Any]:
-    """
-    The reasoning node — calls the LLM to think about the next step.
-
-    The LLM sees the full conversation history (including previous tool results)
-    and either decides to call a tool or gives a final answer.
-    """
-    messages = state["messages"]
-    iteration = state.get("iteration_count", 0)
-
-    logger.info(f"Reason node — iteration {iteration + 1}")
-
-    # The LLM is bound to tools in build_graph(), so it can choose to call them
-    response = _get_bound_llm(state).invoke(messages)
-
-    return {
-        "messages": [response],
-        "iteration_count": iteration + 1,
-    }
-
-
-def _get_bound_llm(state: AgentState):
-    """Get the LLM with tools bound. Cached on the state's metadata."""
-    # This will be set by build_graph() and stored in the graph's config
-    return state.get("_bound_llm")
-
+    return f"Delegated to Editor successfully. THE EDITOR IS NOW EXECUTING: {instructions}"
 
 def build_graph(
     registry: ToolRegistry | None = None,
     model: str | None = None,
 ) -> StateGraph:
     """
-    Build the complete DevIn agent graph.
-
-    Args:
-        registry: Tool registry to use. Defaults to the full Phase 1 toolset.
-        model: LLM model name. Defaults to settings.
-
-    Returns:
-        A compiled LangGraph ready to invoke.
+    Build the DevIn Multi-Agent graph (Architect-Editor Pattern) with Brain V1.5.
     """
     if registry is None:
         registry = create_default_registry()
 
-    tools = registry.get_tools()
-    llm = create_llm(model=model)
+    all_tools = registry.get_tools()
+    
+    # Categorize tools
+    architect_tool_names = ["read_file", "list_directory", "web_search", "get_current_time"]
+    editor_tool_names = ["write_file", "execute_command", "calculator", "get_current_time"]
+    
+    a_tools = [t for t in all_tools if t.name in architect_tool_names]
+    a_tools.append(delegate_to_editor)
+    
+    e_tools = [t for t in all_tools if t.name in editor_tool_names]
 
-    # Bind tools to the LLM so it knows what's available
-    llm_with_tools = llm.bind_tools(tools)
+    # Shared LLM backend
+    architect_llm = create_llm(model=model).bind_tools(a_tools)
+    editor_llm = create_llm(model=model).bind_tools(e_tools)
 
-    # Build the system message
-    system_message = SystemMessage(content=get_system_prompt())
+    # --- Node Configurations ---
 
-    # --- Define the graph nodes ---
+    def initialize_node(state: AgentState) -> dict:
+        """One-time environment discovery."""
+        if state.project_tree:
+            return {"total_steps": state.total_steps + 1}
+        
+        logger.info("🔍 Initializing Environment Context...")
+        try:
+            # Run a fast recursive directory listing (Windows)
+            result = subprocess.run(
+                ["dir", "/b", "/s"], shell=True, capture_output=True, text=True, timeout=5
+            )
+            tree = result.stdout.strip()
+            # truncate if too huge
+            if len(tree) > 2000:
+                tree = tree[:2000] + "\n... [TRUNCATED]"
+        except Exception:
+            tree = "Could not generate tree view."
+            
+        return {"project_tree": tree, "total_steps": state.total_steps + 1}
 
-    def reason(state: dict) -> dict:
-        """Call the LLM with the conversation history."""
-        messages = state["messages"]
-        iteration = state.get("iteration_count", 0)
+    def architect_node(state: AgentState) -> dict:
+        messages = state.messages
+        iteration = state.iteration_count
+        total_steps = state.total_steps
+        tree = state.project_tree
 
-        # Ensure system message is always first
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [system_message] + list(messages)
+        prompt = get_architect_prompt(project_tree=tree, total_steps=total_steps)
 
-        logger.info(f"🧠 Reasoning — iteration {iteration + 1}")
+        # Inject Architect System Prompt
+        if messages and isinstance(messages[0], SystemMessage):
+            msgs = [SystemMessage(content=prompt)] + list(messages[1:])
+        else:
+            msgs = [SystemMessage(content=prompt)] + list(messages)
 
-        response = llm_with_tools.invoke(messages)
+        logger.info(f"🧠 Architect Reasoning — step {total_steps + 1}")
+        response = architect_llm.invoke(msgs)
+        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1}
 
-        return {
-            "messages": [response],
-            "iteration_count": iteration + 1,
-        }
+    def editor_node(state: AgentState) -> dict:
+        messages = state.messages
+        iteration = state.iteration_count
+        total_steps = state.total_steps
+        feedback = state.verification_feedback
 
-    # ToolNode automatically executes tool calls from the LLM's response
-    tool_node = ToolNode(tools)
+        # Look for the last delegation instructions
+        instructions = ""
+        for m in reversed(messages):
+            if isinstance(m, ToolMessage) and m.name == "delegate_to_editor":
+                instructions = m.content
+                break
 
-    # --- Assemble the graph ---
+        prompt = get_editor_prompt(instructions=instructions, feedback=feedback, total_steps=total_steps)
 
-    workflow = StateGraph(dict)
+        if messages and isinstance(messages[0], SystemMessage):
+            msgs = [SystemMessage(content=prompt)] + list(messages[1:])
+        else:
+            msgs = [SystemMessage(content=prompt)] + list(messages)
 
-    workflow.add_node("reason", reason)
-    workflow.add_node("act", tool_node)
+        logger.info(f"⚡ Editor Executing — step {total_steps + 1}")
+        response = editor_llm.invoke(msgs)
+        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1}
 
-    # Entry point
-    workflow.set_entry_point("reason")
+    def validator_node(state: AgentState) -> dict:
+        messages = state.messages
+        total_steps = state.total_steps
+        tree = state.project_tree
 
-    # After reasoning, decide: use a tool or finish?
-    workflow.add_conditional_edges(
-        "reason",
-        _should_continue_edge,
-        {
-            "act": "act",
-            "__end__": END,
-        },
-    )
+        prompt = get_validator_prompt(project_tree=tree, total_steps=total_steps)
 
-    # After acting (tool call), always go back to reasoning
-    workflow.add_edge("act", "reason")
+        if messages and isinstance(messages[0], SystemMessage):
+            msgs = [SystemMessage(content=prompt)] + list(messages[1:])
+        else:
+            msgs = [SystemMessage(content=prompt)] + list(messages)
+
+        logger.info(f"🔍 Validator Reviewing — step {total_steps + 1}")
+        response = architect_llm.invoke(msgs) # Validator uses Architect LLM for better reasoning
+        return {"messages": [response], "total_steps": total_steps + 1}
+
+    # --- Assemble Graph ---
+
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("initialize", initialize_node)
+    workflow.add_node("architect", architect_node)
+    workflow.add_node("architect_tools", ToolNode(a_tools))
+    
+    workflow.add_node("editor", editor_node)
+    workflow.add_node("editor_tools", ToolNode(e_tools))
+    workflow.add_node("validator", validator_node)
+
+    workflow.set_entry_point("initialize")
+    
+    workflow.add_edge("initialize", "architect")
+
+    workflow.add_conditional_edges("architect", architect_should_continue, {"architect_tools": "architect_tools", "__end__": END})
+    workflow.add_conditional_edges("architect_tools", edge_after_architect_tools, {"editor": "editor", "architect": "architect"})
+    
+    workflow.add_conditional_edges("editor", editor_should_continue, {"editor_tools": "editor_tools", "validator": "validator"})
+    workflow.add_edge("editor_tools", "editor")
+
+    workflow.add_conditional_edges("validator", validator_should_continue, {"architect_tools": "architect_tools", "editor": "editor", "architect": "architect"})
 
     compiled = workflow.compile()
-    logger.info(f"✅ Agent graph compiled with {registry.count} tools")
+    logger.info("✅ Multi-Agent Graph Compiled (Verifying Architect)")
 
     return compiled
 
-
-def _should_continue_edge(state: dict) -> Literal["act", "__end__"]:
-    """Edge routing function for the compiled graph."""
-    messages = state.get("messages", [])
-    if not messages:
+def architect_should_continue(state: AgentState) -> Literal["architect_tools", "__end__"]:
+    messages = state.messages
+    if not messages: return "__end__"
+    last = messages[-1]
+    
+    total_steps = state.total_steps
+    if total_steps >= 30: # Increased for verification loops
+        logger.warning(f"CIRCUIT BREAKER: Max total steps ({total_steps}) hit. Stopping.")
         return "__end__"
-
-    last_message = messages[-1]
-    iteration = state.get("iteration_count", 0)
-
-    if iteration >= settings.devin_max_iterations:
-        logger.warning(f"⚠️  Max iterations ({settings.devin_max_iterations}) reached.")
-        return "__end__"
-
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return "act"
-
+        
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "architect_tools"
     return "__end__"
 
+def edge_after_architect_tools(state: AgentState) -> Literal["editor", "architect"]:
+    messages = state.messages
+    if not messages: return "architect"
+    last = messages[-1]
+    
+    if isinstance(last, ToolMessage) and (getattr(last, "name", "") == "delegate_to_editor" or last.tool_call_id == "delegate_to_editor"):
+        return "editor"
+    return "architect"
+
+def editor_should_continue(state: AgentState) -> Literal["editor_tools", "validator"]:
+    messages = state.messages
+    if not messages: return "validator"
+    last = messages[-1]
+    
+    total_steps = state.total_steps
+    if total_steps >= 30:
+        return "validator"
+        
+    if isinstance(last, AIMessage) and last.tool_calls:
+        return "editor_tools"
+    
+    return "validator"
+
+def validator_should_continue(state: AgentState) -> Literal["architect_tools", "editor", "architect"]:
+    messages = state.messages
+    if not messages: return "architect"
+    last = messages[-1]
+
+    if not isinstance(last, AIMessage):
+        return "architect"
+
+    content = last.content.upper()
+    if last.tool_calls:
+        return "architect_tools"
+    
+    if "FAIL" in content:
+        # Pass feedback to editor
+        # Note: In a real graph we might use a dedicated state update, 
+        # but for now we'll rely on the LLM seeing it in history
+        return "editor"
+    
+    return "architect"
 
 def create_agent(model: str | None = None) -> Any:
-    """
-    High-level factory: create a ready-to-use DevIn agent.
-
-    Returns a compiled LangGraph that you can invoke with:
-        result = agent.invoke({"messages": [HumanMessage(content="Hello")]})
-
-    Or stream with:
-        for event in agent.stream({"messages": [HumanMessage(content="Hello")]}):
-            ...
-    """
     registry = create_default_registry()
     graph = build_graph(registry=registry, model=model)
-
-    logger.info("🚀 DevIn agent created and ready")
+    logger.info("🚀 DevIn Brain V1.5 ready")
     return graph

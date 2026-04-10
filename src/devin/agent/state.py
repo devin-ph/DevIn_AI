@@ -41,6 +41,9 @@ class AgentState:
     messages: MessageList = field(default_factory=list)
     current_goal: str = ""
     iteration_count: int = 0
+    total_steps: int = 0
+    project_tree: str = ""
+    verification_feedback: str = ""
     tool_outputs: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     should_stop: bool = False

@@ -23,26 +23,13 @@ def create_llm(
     streaming: bool = True,
     **kwargs,
 ) -> BaseChatModel:
-    """
-    Create an LLM instance based on the model name.
-
-    Auto-detects the provider from the model name:
-    - "gemini-*" → Google (FREE)
-    - "gpt-*" or "o1-*" → OpenAI
-    - "claude-*" → Anthropic
-    - Other → tries Google first, then OpenAI, then Anthropic
-
-    Args:
-        model: Model name (e.g., "gemini-2.0-flash", "gpt-4o").
-               Defaults to DEVIN_DEFAULT_MODEL from settings.
-        temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative).
-        streaming: Enable token-by-token streaming.
-
-    Returns:
-        A configured LangChain chat model instance.
-    """
     model = model or settings.devin_default_model
 
+    # Use OpenRouter if OPENROUTER_API_KEY exists and the model isn't strictly OpenAI/Anthropic/Google specific
+    # Or just fallback to the specific logic
+    if getattr(settings, "openrouter_api_key", None):
+        return _create_openrouter(model, temperature, streaming, **kwargs)
+        
     if _is_google_model(model):
         return _create_google(model, temperature, streaming, **kwargs)
     elif _is_openai_model(model):
@@ -50,7 +37,6 @@ def create_llm(
     elif _is_anthropic_model(model):
         return _create_anthropic(model, temperature, streaming, **kwargs)
     else:
-        # Auto-detect from available keys (prefer free first)
         provider = settings.get_available_provider()
         if provider == "google":
             return _create_google(model, temperature, streaming, **kwargs)
@@ -70,6 +56,23 @@ def _is_openai_model(model: str) -> bool:
 
 def _is_anthropic_model(model: str) -> bool:
     return model.startswith("claude-")
+
+def _create_openrouter(
+    model: str, temperature: float, streaming: bool, **kwargs
+) -> BaseChatModel:
+    """Create an OpenRouter chat model using LangChain OpenAI adapter."""
+    from langchain_openai import ChatOpenAI
+
+    logger.info(f"Creating OpenRouter LLM: {model}")
+    return ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        max_tokens=4000,
+        streaming=streaming,
+        base_url="https://openrouter.ai/api/v1",
+        api_key=settings.openrouter_api_key,
+        **kwargs,
+    )
 
 
 def _create_google(
