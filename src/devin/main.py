@@ -189,9 +189,14 @@ def print_tool_call(name: str, args: dict):
 
 def print_tool_result(content: str):
     """Display tool result (truncated)."""
-    if len(content) > 500:
-        content = content[:500] + "\n  ... (truncated)"
-    console.print(Panel(content, title="Tool Result", border_style="green", padding=(0, 1)))
+    if len(content) > 800:
+        content = content[:800] + "\n  ... (truncated)"
+    console.print(Panel(
+        Text(content, style="green"),
+        title="[bold]Tool Result[/]",
+        border_style="dim green",
+        padding=(0, 1),
+    ))
 
 
 def strip_thoughts(content: str) -> str:
@@ -364,10 +369,15 @@ async def run_cli_async():
             # --- Stream the agent execution with astream_events(version="v2") ---
             try:
                 final_response = ""
+                final_response_str = ""
                 already_rendered = False
                 iteration = 0
-                live_render = None
                 thought_buffer = ThoughtBuffer()
+                printed_thoughts = 0
+                executed_tasks = []
+
+                agent_status = console.status("  [cyan]🧠 Thinking...[/]", spinner="dots")
+                agent_status.start()
 
                 # Stream events from the agent using v2 format
                 try:
@@ -375,22 +385,19 @@ async def run_cli_async():
                         {"messages": full_messages, "iteration_count": 0},
                         version="v2",
                     ):
-                        # Handle interruption during streaming
                         event_type = event.get("event")
                         
-                        # Process on_chain_start events (tool initialization)
                         if event_type == "on_chain_start":
-                            metadata = event.get("metadata", {})
                             name = event.get("name", "")
-                            if name and name not in ["RunnableSequence"]:
-                                # Tool started
-                                pass
+                            if name == "editor_tools":
+                                agent_status.stop()
 
-                        # Process on_chain_end events (tool termination and final state)
                         elif event_type == "on_chain_end":
                             name = event.get("name", "")
+                            if name == "editor_tools":
+                                agent_status.start()
+                                agent_status.update("  [cyan]🧠 Thinking...[/]")
                             
-                            # Capture final conversation state explicitly
                             if name == "LangGraph":
                                 final_state = event.get("data", {}).get("output", {})
                                 if isinstance(final_state, dict) and "messages" in final_state:
@@ -398,20 +405,12 @@ async def run_cli_async():
                                     if conversation:
                                         last_msg = conversation[-1]
                                         if hasattr(last_msg, "content") and last_msg.content:
-                                            # We found the final response directly in the final state
                                             already_rendered = True
-                                            interaction_logger.log("assistant", str(last_msg.content), {"iterations": iteration})
-                                            print_response(str(last_msg.content))
-                            
-                            if name and name not in ["RunnableSequence"]:
-                                # Other chain ends
-                                pass
+                                            final_response_str = str(last_msg.content)
 
-# Process on_chat_model_stream / on_llm_stream events
                         elif event_type in ["on_chat_model_stream", "on_llm_stream"]:
                             data = event.get("data", {})
                             chunk = data.get("chunk")
-                            
                             chunk_content = ""
                             if chunk:
                                 if hasattr(chunk, "content"):
@@ -434,84 +433,118 @@ async def run_cli_async():
                                                 chunk_content += item["text"]
                                 elif isinstance(chunk, str):
                                     chunk_content = chunk
-                                    
                             if chunk_content:
                                 final_response += chunk_content
-                                # Buffer the chunk to handle partial <thought> tags
-                                display_text = thought_buffer.add_chunk(chunk_content)
+                                thought_buffer.add_chunk(chunk_content)
                                 
-                                if live_render is None and display_text:
-                                    console.print()
-                                    live_render = Live(
-                                        Panel(
-                                            Markdown(display_text or "🧠 *Thinking...*"),
-                                            title="[bold cyan]DevIn[/]",
-                                            border_style="cyan",
-                                            padding=(1, 2)
-                                        ),
-                                        console=console,
-                                        refresh_per_second=15,
-                                        transient=True,
-                                    )
-                                    live_render.start()
-                                elif live_render is not None:
-                                    current_display = thought_buffer.get_display_text()
-                                    live_render.update(Panel(
-                                        Markdown(current_display or "🧠 *Thinking...*"),
-                                        title="[bold cyan]DevIn[/]",
-                                        border_style="cyan",
-                                        padding=(1, 2)
-                                    ))
+                                complete_thoughts = thought_buffer.get_complete_thoughts()
+                                if len(complete_thoughts) > printed_thoughts:
+                                    agent_status.stop()
+                                    for t in complete_thoughts[printed_thoughts:]:
+                                        inner = re.sub(r'<thought>|</thought>', '', t).strip()
+                                        if inner:
+                                            # Using the user's styling request
+                                            console.print(f"  [dim italic]💭 {inner[:200]}...[/]" if len(inner) > 200 else f"  [dim italic]💭 {inner}[/]")
+                                    agent_status.start()
+                                    printed_thoughts = len(complete_thoughts)
 
-                        # Process on_tool_start events (tool execution started)
                         elif event_type == "on_tool_start":
                             data = event.get("data", {})
                             name = event.get("name", "")
                             input_data = data.get("input", {})
-                            if name:
-                                if live_render is not None:
-                                    live_render.stop()
-                                    live_render = None
-                                    thought_buffer = ThoughtBuffer()
+                            if name and name not in ["RunnableSequence", "ToolNode", "editor_tools", "architect_tools"]:
                                 iteration += 1
+                                agent_status.stop()
                                 print_tool_call(name, input_data)
+                                agent_status.start()
+                                agent_status.update(f"  [magenta]🔧 Using tool: {name}...[/]")
+                                task_entry = {"tool": name, "input": input_data, "result": None, "run_id": event.get("run_id")}
+                                executed_tasks.append(task_entry)
 
-                        # Process on_tool_end events (tool execution completed)
                         elif event_type == "on_tool_end":
                             name = event.get("name", "")
-                            # Skip printing wrapper LangGraph nodes 
                             if name in ["RunnableSequence", "ToolNode", "editor_tools", "architect_tools"]:
                                 continue
                             
                             data = event.get("data", {})
+                            run_id = event.get("run_id")
                             if "output" in data:
                                 output = data["output"]
-                                # Safely unwrap dicts with nested messages
+                                res = ""
                                 if isinstance(output, dict) and "messages" in output:
-                                    messages = output["messages"]
-                                    if messages and hasattr(messages[-1], 'content'):
-                                        print_tool_result(str(messages[-1].content))
-                                        continue
-                                        
-                                if hasattr(output, 'content'):
-                                    print_tool_result(str(output.content))
-                                elif isinstance(output, str):
-                                    print_tool_result(output)
+                                    messages_out = output["messages"]
+                                    if messages_out and hasattr(messages_out[-1], 'content'):
+                                        res = str(messages_out[-1].content)
+                                elif hasattr(output, 'content'):
+                                    res = str(output.content)
                                 else:
-                                    print_tool_result(str(output))
+                                    res = str(output)
+                                    
+                                res = res.strip()
+                                # Update the correct task by tracking run_id or fallback to name
+                                for task in reversed(executed_tasks):
+                                    if (task.get("run_id") == run_id or task["tool"] == name) and task["result"] is None:
+                                        task["result"] = res
+                                        break
+                                
+                                agent_status.stop()
+                                print_tool_result(res)
+                                agent_status.startnt)
+                                elif hasattr(output, 'content'):
+                                    res = str(output.content)
+                                else:
+                                    res = str(output)
+                                    
+                                res = res.strip()
+                                # Update the correct task by tracking run_id or fallback to name
+                                for task in reversed(executed_tasks):
+                                    if (task.get("run_id") == run_id or task["tool"] == name) and task["result"] is None:
+                                        task["result"] = res
+                                        break
+                                
+                                agent_status.stop()
+                                print_tool_result(res)
+                                agent_status.start()
+                                    
+                            agent_status.update("  [cyan]🧠 Thinking...[/]")
 
-                except KeyboardInterrupt:
-                    if live_render is not None:
-                        live_render.stop()
-                    console.print("\n  [devin.system]⚡ Interrupted. Ready for next input.[/]\n")
+                except Exception as e:
+                    agent_status.stop()
+                    print_error(f"Execution failed: {e}")
+                    logger.exception("Graph execution failed.")
+                    if conversation and isinstance(conversation[-1], HumanMessage):
+                        conversation.pop()
+                    console.print("\n  [devin.system]⚠️ Graph execution crashed. State has been reset. Ready for next input.[/]\n")
                     continue
+                finally:
+                    agent_status.stop()
 
-                # Finalize thought buffer
-                if live_render is not None:
-                    live_render.stop()
-                    live_render = None
+                if executed_tasks:
+                    summary_text = ""
+                    for idx, task in enumerate(executed_tasks, 1):
+                        tool_name = task["tool"]
+                        res = task["result"] or "Done"
+                        res_str = res if len(res) < 150 else res[:150] + "..."
+                        args_str = ""
+                        if task["input"]:
+                            try:
+                                import json
+                                args_str = json.dumps(task["input"], ensure_ascii=False)
+                                if len(args_str) > 100:
+                                    args_str = args_str[:100] + "..."
+                                args_str = f" [dim]({args_str})[/]"
+                            except:
+                                pass
+                        res_str = res_str.replace("[", "\[").replace("]", "\]")
+                        summary_text += f"[bold magenta] {idx}. {tool_name}[/]{args_str}\n   [dim green]↪ {res_str}[/]\n\n"
 
-                if not already_rendered and final_response:
+                    console.print()
+                    console.print(Panel(summary_text.strip(), title="[bold green]📋 Task Summary[/]", border_style="green", padding=(1, 2)))
+
+                if already_rendered and final_response_str:
+                    interaction_logger.log("assistant", final_response_str, {"iterations": iteration})
+                    print_response(final_response_str)
+                elif not already_rendered and final_response:
                     interaction_logger.log("assistant", final_response, {"iterations": iteration})
                     print_response(final_response)
                 elif not already_rendered and not final_response:
@@ -520,25 +553,6 @@ async def run_cli_async():
             except KeyboardInterrupt:
                 console.print("\n  [devin.system]⚡ Interrupted. Ready for next input.[/]\n")
                 continue
-            except Exception as e:
-                print_error(f"Agent error: {e}")
-                if debug_mode:
-                    console.print_exception()
-                
-                # Cleanup broken state to avoid indefinite hang
-                if live_render is not None:
-                    try:
-                        live_render.stop()
-                    except:
-                        pass
-                
-                # Pop the broken human message from conversation so it can be retried cleanly
-                if conversation and isinstance(conversation[-1], HumanMessage):
-                    conversation.pop()
-                    
-                console.print("\n  [devin.system]⚠️ Graph execution crashed. State has been reset. Ready for next input.[/]\n")
-                continue
-
         except KeyboardInterrupt:
             console.print("\n  [devin.system]👋 Goodbye![/]\n")
             break
