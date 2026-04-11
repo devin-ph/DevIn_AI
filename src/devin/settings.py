@@ -23,7 +23,7 @@ class DevinSettings(BaseSettings):
     google_api_key: str = ""           # FREE — Google Gemini
     openai_api_key: str = ""           # Optional (paid)
     anthropic_api_key: str = ""        # Optional (paid)
-    devin_default_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    devin_default_model: str = "gemini-2.0-flash"
 
     # --- Search ---
     tavily_api_key: str = ""           # Optional — DuckDuckGo is the free default

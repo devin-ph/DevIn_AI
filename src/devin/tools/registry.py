@@ -93,17 +93,27 @@ def create_default_registry() -> ToolRegistry:
     from devin.tools.calculator import calculator_tool
     from devin.tools.search import web_search_tool
     from devin.tools.time_tool import current_time_tool
-    from devin.tools.system import read_file, write_file, list_directory, execute_command
+    from devin.tools.system import (
+        read_file, write_file, list_directory, execute_command,
+        grep_search, file_search, edit_file_replace, analyze_python_ast,
+        search_code_bm25, read_function_only
+    )
 
     registry = ToolRegistry()
     registry.register(calculator_tool, category="math")
     registry.register(current_time_tool, category="utility")
     registry.register(web_search_tool, category="search")
     
-    # Phase 2: System Tools
+    # Phase 2/3/4: System Tools
     registry.register(read_file, category="system")
     registry.register(write_file, category="system")
     registry.register(list_directory, category="system")
     registry.register(execute_command, category="system")
+    registry.register(grep_search, category="system")
+    registry.register(file_search, category="system")
+    registry.register(edit_file_replace, category="system")
+    registry.register(analyze_python_ast, category="system")
+    registry.register(search_code_bm25, category="system")
+    registry.register(read_function_only, category="system")
 
     return registry

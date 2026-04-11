@@ -256,7 +256,22 @@ def build_graph(
         else:
             msgs = [SystemMessage(content=prompt)] + list(messages)
 
-        msgs = _truncate_tool_messages(msgs)
+        # Remove the delegate_to_editor tool call so the LLM does not think it is the Architect
+        cleaned_msgs = []
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        for m in msgs:
+            if isinstance(m, AIMessage) and m.tool_calls:
+                new_tcs = [tc for tc in m.tool_calls if tc["name"] != "delegate_to_editor"]
+                if len(new_tcs) != len(m.tool_calls):
+                    cleaned_msgs.append(AIMessage(content=m.content, tool_calls=new_tcs))
+                    continue
+            if isinstance(m, ToolMessage) and m.name == "delegate_to_editor":
+                cleaned_msgs.append(HumanMessage(content=f"ARCHITECT DELEGATION INSTRUCTIONS:\n{m.content}"))
+                continue
+            cleaned_msgs.append(m)
+
+        msgs = _truncate_tool_messages(cleaned_msgs)
         msgs = _compress_history(msgs)
 
         logger.info(f"⚡ Editor Executing — step {total_steps + 1}")
