@@ -19,6 +19,12 @@ from langchain_core.messages import AnyMessage
 # This is critical — it preserves conversation history across graph cycles.
 MessageList = Annotated[Sequence[AnyMessage], operator.add]
 
+def _replace_or_add(old: list, new: list) -> list:
+    # If new list is empty [], it means reset signal from validator
+    if new == []:
+        return []
+    # Otherwise accumulate
+    return old + [x for x in new if x not in old]
 
 @dataclass
 class AgentState:
@@ -43,7 +49,10 @@ class AgentState:
     iteration_count: int = 0
     total_steps: int = 0
     project_tree: str = ""
+    active_skills: str = ""
+    project_rules: str = ""
     verification_feedback: str = ""
+    modified_files: Annotated[list[str], _replace_or_add] = field(default_factory=list)
     tool_outputs: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     should_stop: bool = False
