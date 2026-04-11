@@ -489,21 +489,6 @@ async def run_cli_async():
                                 
                                 agent_status.stop()
                                 print_tool_result(res)
-                                agent_status.startnt)
-                                elif hasattr(output, 'content'):
-                                    res = str(output.content)
-                                else:
-                                    res = str(output)
-                                    
-                                res = res.strip()
-                                # Update the correct task by tracking run_id or fallback to name
-                                for task in reversed(executed_tasks):
-                                    if (task.get("run_id") == run_id or task["tool"] == name) and task["result"] is None:
-                                        task["result"] = res
-                                        break
-                                
-                                agent_status.stop()
-                                print_tool_result(res)
                                 agent_status.start()
                                     
                             agent_status.update("  [cyan]🧠 Thinking...[/]")
