@@ -375,6 +375,7 @@ async def run_cli_async():
                 thought_buffer = ThoughtBuffer()
                 printed_thoughts = 0
                 executed_tasks = []
+                total_token_usage = {}
 
                 agent_status = console.status("  [cyan]🧠 Thinking...[/]", spinner="dots")
                 agent_status.start()
@@ -400,13 +401,16 @@ async def run_cli_async():
                             
                             if name == "LangGraph":
                                 final_state = event.get("data", {}).get("output", {})
-                                if isinstance(final_state, dict) and "messages" in final_state:
-                                    conversation = list(final_state["messages"])
-                                    if conversation:
-                                        last_msg = conversation[-1]
-                                        if hasattr(last_msg, "content") and last_msg.content:
-                                            already_rendered = True
-                                            final_response_str = str(last_msg.content)
+                                if isinstance(final_state, dict):
+                                    if "messages" in final_state:
+                                        conversation = list(final_state["messages"])
+                                        if conversation:
+                                            last_msg = conversation[-1]
+                                            if hasattr(last_msg, "content") and last_msg.content:
+                                                already_rendered = True
+                                                final_response_str = str(last_msg.content)
+                                    if "token_usage" in final_state:
+                                        total_token_usage = final_state["token_usage"]
 
                         elif event_type in ["on_chat_model_stream", "on_llm_stream"]:
                             data = event.get("data", {})
@@ -510,18 +514,8 @@ async def run_cli_async():
                         tool_name = task["tool"]
                         res = task["result"] or "Done"
                         res_str = res if len(res) < 150 else res[:150] + "..."
-                        args_str = ""
-                        if task["input"]:
-                            try:
-                                import json
-                                args_str = json.dumps(task["input"], ensure_ascii=False)
-                                if len(args_str) > 100:
-                                    args_str = args_str[:100] + "..."
-                                args_str = f" [dim]({args_str})[/]"
-                            except:
-                                pass
-                        res_str = res_str.replace("[", "\[").replace("]", "\]")
-                        summary_text += f"[bold magenta] {idx}. {tool_name}[/]{args_str}\n   [dim green]↪ {res_str}[/]\n\n"
+                        res_str = res_str.replace("[", "\\[").replace("]", "\\]")
+                        summary_text += f"[bold magenta]{idx}. {tool_name}[/] → [dim green]{res_str}[/]\n"
 
                     console.print()
                     console.print(Panel(summary_text.strip(), title="[bold green]📋 Task Summary[/]", border_style="green", padding=(1, 2)))
@@ -534,6 +528,13 @@ async def run_cli_async():
                     print_response(final_response)
                 elif not already_rendered and not final_response:
                     print_error("Agent did not produce a response.")
+                    
+                if total_token_usage and total_token_usage.get("total_tokens", 0) > 0:
+                    in_t = total_token_usage.get("input_tokens", 0)
+                    out_t = total_token_usage.get("output_tokens", 0)
+                    tot_t = total_token_usage.get("total_tokens", 0)
+                    calls = total_token_usage.get("llm_calls", 0)
+                    console.print(f"  [dim]📊 {tot_t:,} tokens ({in_t:,} in / {out_t:,} out) · {calls} LLM calls[/]")
 
             except KeyboardInterrupt:
                 console.print("\n  [devin.system]⚡ Interrupted. Ready for next input.[/]\n")

@@ -26,6 +26,17 @@ def _replace_or_add(old: list, new: list) -> list:
     # Otherwise accumulate
     return old + [x for x in new if x not in old]
 
+def _merge_token_usage(old: dict, new: dict) -> dict:
+    """Accumulate token counts across all LLM calls."""
+    if not old:
+        old = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "llm_calls": 0}
+    return {
+        "input_tokens": old.get("input_tokens", 0) + new.get("input_tokens", 0),
+        "output_tokens": old.get("output_tokens", 0) + new.get("output_tokens", 0),
+        "total_tokens": old.get("total_tokens", 0) + new.get("total_tokens", 0),
+        "llm_calls": old.get("llm_calls", 0) + new.get("llm_calls", 0),
+    }
+
 @dataclass
 class AgentState:
     """
@@ -57,3 +68,4 @@ class AgentState:
     error: str | None = None
     should_stop: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    token_usage: Annotated[dict, _merge_token_usage] = field(default_factory=dict)
