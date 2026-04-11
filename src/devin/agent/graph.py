@@ -28,6 +28,71 @@ import logging
 from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+def _summarize_history(messages: list, keep_recent: int = 4) -> list:
+    """
+    Compress old messages into a structured summary when history is too long.
+    Zero LLM calls — extracts structured data from existing messages.
+    Keeps the last `keep_recent` message pairs intact for immediate context.
+    """
+    if len(messages) <= (keep_recent * 2 + 1):  # +1 for system prompt
+        return messages  # Not long enough to summarize
+    
+    # Separate system prompt, old messages, recent messages
+    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+    
+    if len(non_system) <= keep_recent * 2:
+        return messages
+    
+    old_messages = non_system[:-keep_recent * 2]
+    recent_messages = non_system[-keep_recent * 2:]
+    
+    # Extract structured data from old messages
+    goals_achieved = []
+    files_modified = []
+    decisions_made = []
+    errors_encountered = []
+    
+    import re
+    for msg in old_messages:
+        if isinstance(msg, HumanMessage):
+            content = str(msg.content)[:100]
+            goals_achieved.append(f"User requested: {content}")
+        elif isinstance(msg, ToolMessage):
+            content = str(msg.content)
+            tool_name = getattr(msg, 'name', '')
+            if tool_name in ('write_file', 'edit_file_replace') and 'Success' in content:
+                match = re.search(r'to (.+?\.\w+)', content)
+                if match:
+                    files_modified.append(match.group(1))
+            elif tool_name == 'execute_command':
+                if 'Exit code: 0' in content:
+                    cmd_match = re.search(r'command: (.+)', content)
+                    if cmd_match:
+                        decisions_made.append(f"Ran: {cmd_match.group(1)[:60]}")
+                elif 'Exit code:' in content and 'Exit code: 0' not in content:
+                    errors_encountered.append(content[:100].replace('\n', ' '))
+    
+    # Build structured summary
+    summary_parts = ["=== CONVERSATION HISTORY SUMMARY ==="]
+    if goals_achieved:
+        summary_parts.append(f"Goals completed: {'; '.join(goals_achieved[-3:])}")
+    if files_modified:
+        unique_files = list(dict.fromkeys(files_modified))  # deduplicate, preserve order
+        summary_parts.append(f"Files modified: {', '.join(unique_files)}")
+    if decisions_made:
+        summary_parts.append(f"Commands run: {'; '.join(decisions_made[-3:])}")
+    if errors_encountered:
+        summary_parts.append(f"Errors seen: {'; '.join(errors_encountered[-2:])}")
+    summary_parts.append("=== END SUMMARY — RECENT CONTEXT FOLLOWS ===")
+    
+    summary_message = HumanMessage(
+        content="\n".join(summary_parts)
+    )
+    
+    return system_msgs + [summary_message] + recent_messages
+
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
@@ -67,9 +132,12 @@ def build_graph(
 
     all_tools = registry.get_tools()
     
+    from devin.tools.system import git_diff, git_status, self_check_file
+    all_tools.extend([git_diff, git_status, self_check_file])
+    
     # Categorize tools
-    architect_tool_names = ["read_file", "list_directory", "web_search", "get_current_time", "file_search", "grep_search", "analyze_python_ast"]
-    editor_tool_names = ["write_file", "edit_file_replace", "execute_command", "calculator", "get_current_time", "read_file", "file_search", "grep_search", "analyze_python_ast"]
+    architect_tool_names = ["read_file", "list_directory", "web_search", "get_current_time", "file_search", "grep_search", "analyze_python_ast", "git_diff", "git_status"]
+    editor_tool_names = ["write_file", "edit_file_replace", "execute_command", "calculator", "get_current_time", "read_file", "file_search", "grep_search", "analyze_python_ast", "git_diff", "git_status", "self_check_file"]
     
     a_tools = [t for t in all_tools if t.name in architect_tool_names]
     a_tools.append(delegate_to_editor)
@@ -202,9 +270,29 @@ def build_graph(
             "project_rules": project_rules_content,
             "total_steps": state.total_steps + 1
         }
+        
+    def _extract_token_usage(response) -> dict:
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "llm_calls": 1}
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            meta = response.usage_metadata
+            if isinstance(meta, dict):
+                usage["input_tokens"] = meta.get("input_tokens", 0)
+                usage["output_tokens"] = meta.get("output_tokens", 0)
+                usage["total_tokens"] = meta.get("total_tokens", 0)
+            else:
+                usage["input_tokens"] = getattr(meta, "input_tokens", 0)
+                usage["output_tokens"] = getattr(meta, "output_tokens", 0)
+                usage["total_tokens"] = getattr(meta, "total_tokens", 0)
+        return usage
 
     def architect_node(state: AgentState) -> dict:
         messages = state.messages
+        SUMMARIZE_AFTER_TURNS = 10
+        non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
+        if non_system_count > SUMMARIZE_AFTER_TURNS:
+            logger.info(f"Summarizing history: {non_system_count} messages → compressed")
+            messages = _summarize_history(list(messages), keep_recent=4)
+            
         iteration = state.iteration_count
         total_steps = state.total_steps
         tree = state.project_tree
@@ -227,11 +315,18 @@ def build_graph(
 
         logger.info(f"🧠 Architect Reasoning — step {total_steps + 1}")
         response = architect_llm.invoke(msgs)
-        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1}
+        usage = _extract_token_usage(response)
+        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
     def editor_node(state: AgentState) -> dict:
         logger.info(f'⚡ EDITOR NODE CALLED — messages count: {len(state.messages)}')
         messages = state.messages
+        SUMMARIZE_AFTER_TURNS = 10
+        non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
+        if non_system_count > SUMMARIZE_AFTER_TURNS:
+            logger.info(f"Summarizing history: {non_system_count} messages → compressed")
+            messages = _summarize_history(list(messages), keep_recent=4)
+            
         iteration = state.iteration_count
         total_steps = state.total_steps
         feedback = state.verification_feedback
@@ -276,10 +371,17 @@ def build_graph(
 
         logger.info(f"⚡ Editor Executing — step {total_steps + 1}")
         response = editor_llm.invoke(msgs)
-        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1}
+        usage = _extract_token_usage(response)
+        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
     def validator_node(state: AgentState) -> dict:
         messages = state.messages
+        SUMMARIZE_AFTER_TURNS = 10
+        non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
+        if non_system_count > SUMMARIZE_AFTER_TURNS:
+            logger.info(f"Summarizing history: {non_system_count} messages → compressed")
+            messages = _summarize_history(list(messages), keep_recent=4)
+            
         total_steps = state.total_steps
         tree = state.project_tree
         modified_files = getattr(state, "modified_files", []) or []
@@ -301,6 +403,7 @@ def build_graph(
 
         logger.info(f"🔍 Validator Reviewing — step {total_steps + 1}")
         response = architect_llm.invoke(msgs) # Validator uses Architect LLM for better reasoning
+        usage = _extract_token_usage(response)
         
         # Hard Validation block
         import subprocess
@@ -341,7 +444,8 @@ def build_graph(
             "messages": [response], 
             "total_steps": total_steps + 1,
             "verification_feedback": feedback,
-            "modified_files": []
+            "modified_files": [],
+            "token_usage": usage
         }
 
     # --- Assemble Graph ---
@@ -379,8 +483,29 @@ def build_graph(
             return ToolNode(e_tools).invoke(state)
             
         import json
+        from pathlib import Path
         for tc in tool_calls:
             if tc["name"] in mutation_tools:
+                filepath = tc["args"].get("filepath", "")
+                
+                # Show git diff if file exists (before showing consent)
+                if filepath and Path(filepath).exists() and tc["name"] in ("write_file", "edit_file_replace"):
+                    diff_result = subprocess.run(
+                        ["git", "diff", "HEAD", filepath],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if diff_result.stdout.strip():
+                        print(f"\n📄 Current diff for {filepath}:")
+                        # Print first 30 lines of diff
+                        diff_lines = diff_result.stdout.strip().splitlines()[:30]
+                        for line in diff_lines:
+                            if line.startswith("+"):
+                                print(f"  \033[32m{line}\033[0m")  # green
+                            elif line.startswith("-"):
+                                print(f"  \033[31m{line}\033[0m")  # red
+                            else:
+                                print(f"  {line}")
+                
                 args_str = json.dumps(tc["args"], indent=2, ensure_ascii=False)
                 print(f"\n⚠️  DevIn wants to run: {tc['name']}")
                 print(f"   Args:\n{args_str}")
@@ -415,7 +540,7 @@ def build_graph(
     workflow.add_conditional_edges("architect", architect_should_continue, {"architect_tools": "architect_tools", "__end__": END})
     workflow.add_conditional_edges("architect_tools", edge_after_architect_tools, {"editor": "editor", "architect": "architect"})
     
-    workflow.add_conditional_edges("editor", editor_should_continue, {"editor_tools": "editor_tools", "validator": "validator"})
+    workflow.add_conditional_edges("editor", editor_should_continue, {"editor_tools": "editor_tools", "validator": "validator", "architect": "architect"})
     workflow.add_edge("editor_tools", "editor")
 
     workflow.add_conditional_edges("validator", validator_should_continue, {"architect_tools": "architect_tools", "editor": "editor", "architect": "architect"})
@@ -431,7 +556,7 @@ def architect_should_continue(state: AgentState) -> Literal["architect_tools", "
     last = messages[-1]
     
     total_steps = state.total_steps
-    if total_steps >= 30: # Increased for verification loops
+    if total_steps >= 15: # Increased for verification loops
         logger.warning(f"CIRCUIT BREAKER: Max total steps ({total_steps}) hit. Stopping.")
         return "__end__"
         
@@ -448,7 +573,7 @@ def edge_after_architect_tools(state: AgentState) -> Literal["editor", "architec
         return "editor"
     return "architect"
 
-def editor_should_continue(state: AgentState) -> Literal["editor_tools", "validator"]:
+def editor_should_continue(state: AgentState) -> Literal["editor_tools", "validator", "architect"]:
     messages = state.messages
     if not messages: return "validator"
     last = messages[-1]
@@ -460,6 +585,9 @@ def editor_should_continue(state: AgentState) -> Literal["editor_tools", "valida
     if isinstance(last, AIMessage) and last.tool_calls:
         return "editor_tools"
     
+    if not getattr(state, "modified_files", []):
+        return "architect"
+        
     return "validator"
 
 def validator_should_continue(state: AgentState) -> Literal["architect_tools", "editor", "architect"]:

@@ -477,3 +477,87 @@ def read_function_only(filepath: str, function_name: str) -> str:
         return f"Syntax Error parsing {filepath}: {e}"
     except Exception as e:
         return f"Error extracting function from {filepath}: {e}"
+
+@tool
+def git_diff(filepath: str = "") -> str:
+    """
+    Show git diff for a specific file or entire working directory.
+    Use before editing to understand current state.
+    
+    Args:
+        filepath: Specific file to diff, or empty string for full diff.
+    """
+    import subprocess
+    from pathlib import Path
+    
+    cmd = ["git", "diff", "HEAD"]
+    if filepath:
+        cmd.append(filepath)
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            # Not a git repo or no commits yet
+            return f"Git diff unavailable: {result.stderr.strip()}"
+        output = result.stdout.strip()
+        if not output:
+            return "No changes detected (working tree clean)."
+        # Truncate very large diffs
+        lines = output.splitlines()
+        if len(lines) > 100:
+            output = "\n".join(lines[:100]) + f"\n... [{len(lines)-100} more lines]"
+        return output
+    except FileNotFoundError:
+        return "Git not available in this environment."
+    except Exception as e:
+        return f"Error running git diff: {e}"
+
+
+@tool
+def git_status() -> str:
+    """Show current git status — which files are modified, staged, or untracked."""
+    import subprocess
+    try:
+        result = subprocess.run(["git", "status", "--short"], capture_output=True, text=True, timeout=10)
+        return result.stdout.strip() or "Working tree clean."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@tool
+def self_check_file(filepath: str) -> str:
+    """
+    Instantly validate a Python file after writing.
+    Runs py_compile for syntax + basic import check.
+    Returns PASS or FAIL with exact error location.
+    
+    Args:
+        filepath: Path to the Python file to check.
+    """
+    import sys
+    import subprocess
+    from pathlib import Path
+    
+    path = Path(filepath)
+    if not path.exists():
+        return f"FAIL — File {filepath} does not exist."
+    if path.suffix != ".py":
+        return "SKIP — Not a Python file, no syntax check needed."
+    
+    # Step 1: Syntax check
+    result = subprocess.run(
+        [sys.executable, "-m", "py_compile", filepath],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return f"FAIL — Syntax error:\n{result.stderr.strip()}"
+    
+    # Step 2: flake8 if available (style + unused imports)
+    flake_result = subprocess.run(
+        [sys.executable, "-m", "flake8", "--max-line-length=100", "--select=E9,F8", filepath],
+        capture_output=True, text=True
+    )
+    if flake_result.returncode != 0 and flake_result.stdout.strip():
+        return f"PASS (syntax) but WARN — style issues:\n{flake_result.stdout.strip()[:300]}"
+    
+    return f"PASS — {filepath} is syntactically valid."
