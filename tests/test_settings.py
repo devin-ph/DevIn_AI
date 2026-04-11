@@ -15,7 +15,7 @@ class TestSettings:
             openai_api_key="",
             anthropic_api_key="",
         )
-        assert settings.devin_default_model == "gemini-2.0-flash"
+        assert settings.devin_default_model == "gemini-2.5-flash"
         assert settings.devin_max_iterations == 15
         assert settings.devin_require_confirmation is True
 
