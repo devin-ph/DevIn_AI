@@ -302,6 +302,20 @@ def handle_slash_command(
     return conversation, debug_mode, True
 
 
+SIMPLE_INTENTS = [
+    "hi", "hello", "hey", "thanks", "thank you", "bye", "goodbye",
+    "what can you do", "help", "who are you", "what are you",
+    "good morning", "good evening", "how are you"
+]
+
+def _is_simple_intent(message: str) -> bool:
+    """Detect casual/greeting messages that don't need full agent graph."""
+    msg = message.lower().strip()
+    # Short messages (4 words or less) that match known intents
+    if len(msg.split()) <= 5:
+        return any(intent in msg for intent in SIMPLE_INTENTS)
+    return False
+
 # --- Main Loop (Async) ---
 
 async def run_cli_async():
@@ -365,6 +379,32 @@ async def run_cli_async():
             full_messages = conversation
 
             console.print()  # spacing
+
+            # --- Fast path for simple intents (saves ~5,000 tokens per greeting) ---
+            if _is_simple_intent(user_input):
+                try:
+                    from devin.agent.llm_provider import create_llm
+                    from langchain_core.messages import SystemMessage, HumanMessage
+                    quick_llm = create_llm()
+                    quick_response = quick_llm.invoke([
+                        SystemMessage(content=(
+                            "You are DevIn, an autonomous AI coding assistant. "
+                            "Respond naturally and concisely to casual messages. "
+                            "If asked what you can do, mention: writing code, editing files, "
+                            "running commands, debugging, and researching."
+                        )),
+                        HumanMessage(content=user_input)
+                    ])
+                    response_text = quick_response.content if hasattr(quick_response, 'content') else str(quick_response)
+                    interaction_logger.log("assistant", response_text, {"fast_path": True})
+                    # We appended user_message earlier
+                    from langchain_core.messages import AIMessage
+                    conversation.append(AIMessage(content=response_text))
+                    print_response(response_text)
+                    continue  # Skip full graph execution entirely
+                except Exception as e:
+                    logger.debug(f"Fast path failed, falling back to full graph: {e}")
+                    # Fall through to full graph if fast path fails
 
             # --- Stream the agent execution with astream_events(version="v2") ---
             try:

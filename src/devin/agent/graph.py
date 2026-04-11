@@ -27,7 +27,89 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
+import os
+from pathlib import Path
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+# Skill loading priority and triggers
+SKILL_LOAD_RULES = {
+    "WHO_YOU_ARE.md":        ["*"],        # Always load (small, identity-critical)
+    "ESCALATION_POLICY.md": ["*"],        # Always load (safety-critical)
+    "CODE_STYLE.md":        [             # Load only for code tasks
+        "write", "create", "edit", "code", "function", "class",
+        "def ", "import", "fix", "bug", "refactor", "implement"
+    ],
+    "TASK_DECOMPOSITION.md": [            # Load only for multi-step tasks
+        "create", "build", "implement", "refactor", "fix",
+        "add feature", "make", "develop", "setup", "configure"
+    ],
+    "MEMORY_PROTOCOL.md":   [],           # Never auto-load (load on demand)
+}
+
+def _load_relevant_skills(user_message: str, skills_dir: str) -> str:
+    """Load only skills relevant to the current request."""
+    logger = logging.getLogger("devin")
+    msg_lower = user_message.lower()
+    content = ""
+    loaded = []
+    
+    for filename, triggers in SKILL_LOAD_RULES.items():
+        filepath = os.path.join(skills_dir, filename)
+        if not os.path.exists(filepath):
+            continue
+        
+        should_load = (
+            triggers == ["*"] or
+            any(trigger in msg_lower for trigger in triggers)
+        )
+        
+        if should_load:
+            with open(filepath, "r", encoding="utf-8") as f:
+                skill_content = f.read()
+                # Truncate individual skills to 2000 chars max
+                if len(skill_content) > 2000:
+                    skill_content = skill_content[:2000] + "\n... [truncated]"
+                content += f"\n--- {filename} ---\n{skill_content}\n"
+                loaded.append(filename)
+    
+    logger.info(f"Skills loaded: {loaded}")
+    return content
+
+def _build_smart_tree(root_path: str, max_depth: int = 2, max_files_per_dir: int = 8) -> str:
+    """Build a concise project tree — depth-limited and file-count-limited."""
+    IGNORE = {'.git', '__pycache__', '.venv', 'node_modules', '.pytest_cache', 
+              'dist', 'build', '.eggs', '*.egg-info'}
+    lines = []
+    root = Path(root_path).resolve()
+    
+    def _walk(path: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name))
+        except PermissionError:
+            return
+        
+        dirs = [e for e in entries if e.is_dir() and e.name not in IGNORE]
+        files = [e for e in entries if e.is_file() and not e.name.startswith('.')]
+        
+        for f in files[:max_files_per_dir]:
+            indent = "  " * depth
+            lines.append(f"{indent}📄 {f.name}")
+        if len(files) > max_files_per_dir:
+            lines.append(f"{'  ' * depth}  ... [{len(files) - max_files_per_dir} more files]")
+        
+        for d in dirs:
+            indent = "  " * depth
+            lines.append(f"{indent}📁 {d.name}/")
+            _walk(d, depth + 1)
+    
+    _walk(root, 0)
+    
+    result = "\n".join(lines)
+    if len(result) > 1500:
+        result = result[:1500] + "\n... [tree truncated]"
+    return result
 
 def _summarize_history(messages: list, keep_recent: int = 4) -> list:
     """
@@ -218,20 +300,15 @@ def build_graph(
         
         logger.info("🔍 Initializing Environment Context...")
         
-        active_skills_content = ""
+        # Get the original user message from state to determine relevant skills
+        original_message = ""
+        for msg in state.messages:
+            if hasattr(msg, 'content') and isinstance(msg.content, str):
+                original_message = msg.content
+                break
+
         skills_dir = os.path.join(os.path.dirname(__file__), "..", "skills")
-        if os.path.exists(skills_dir):
-            priority_files = ["WHO_YOU_ARE.md", "ESCALATION_POLICY.md"]
-            files = [f for f in os.listdir(skills_dir) if f.endswith(".md")]
-            files.sort(key=lambda x: (0 if x in priority_files else 1, x))
-            
-            for filename in files:
-                with open(os.path.join(skills_dir, filename), "r", encoding="utf-8") as f:
-                    content = f"\n--- {filename} ---\n{f.read()}\n"
-                    if len(active_skills_content) + len(content) > 12000 and filename not in priority_files:
-                        active_skills_content += f"\n--- {filename} ---\n... [SKILLS TRUNCATED TO FIT FREE TIER CONTEXT]\n"
-                        break
-                    active_skills_content += content
+        active_skills_content = _load_relevant_skills(original_message, skills_dir)
         
         project_rules_content = ""
         devin_md_path = os.path.join(os.getcwd(), "DEVIN.md")
@@ -244,23 +321,7 @@ def build_graph(
             project_rules_content = project_rules_content[:3000] + "\n\n... [RULES TRUNCATED]"
 
         try:
-            tree_lines = []
-            for root, dirs, files in os.walk(os.getcwd()):
-                dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', '.venv', 'node_modules', 'dist', 'build', '.pytest_cache')]
-                rel_dir = os.path.relpath(root, os.getcwd())
-                
-                # Append files as relative paths
-                for f in files:
-                    if f.endswith(('.exe', '.dll', '.so', '.pyc')): continue
-                    path = f if rel_dir == '.' else os.path.join(rel_dir, f)
-                    tree_lines.append(path.replace('\\', '/'))
-                    
-                if len(tree_lines) > 200:
-                    tree_lines.append("... [MORE FILES TRUNCATED]")
-                    break
-            tree = "\n".join(tree_lines)
-            if len(tree) > 3000:
-                tree = tree[:3000] + "\n... [TRUNCATED]"
+            tree = _build_smart_tree(os.getcwd(), max_depth=2)
         except Exception:
             tree = "Could not generate tree view."
             
