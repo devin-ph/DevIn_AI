@@ -384,7 +384,6 @@ async def run_cli_async():
             if _is_simple_intent(user_input):
                 try:
                     from devin.agent.llm_provider import create_llm
-                    from langchain_core.messages import SystemMessage, HumanMessage
                     quick_llm = create_llm()
                     quick_response = quick_llm.invoke([
                         SystemMessage(content=(
@@ -398,7 +397,6 @@ async def run_cli_async():
                     response_text = quick_response.content if hasattr(quick_response, 'content') else str(quick_response)
                     interaction_logger.log("assistant", response_text, {"fast_path": True})
                     # We appended user_message earlier
-                    from langchain_core.messages import AIMessage
                     conversation.append(AIMessage(content=response_text))
                     print_response(response_text)
                     continue  # Skip full graph execution entirely
