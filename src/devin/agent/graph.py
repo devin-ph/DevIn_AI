@@ -214,10 +214,13 @@ def build_graph(
     
     w_tools = [t for t in all_tools if t.name in worker_tool_names]
 
-    # Shared LLM backend
-    # Adding .with_retry() to transparently handle OpenRouter 'Provider returned error' api drops
-    architect_llm = create_llm(model=model).bind_tools(a_tools).with_retry(stop_after_attempt=4)
-    worker_llm = create_llm(model=model).bind_tools(w_tools).with_retry(stop_after_attempt=4)
+    from devin.agent.query import QueryEngine
+
+    architect_llm = create_llm(model=model).bind_tools(a_tools)
+    worker_llm = create_llm(model=model).bind_tools(w_tools)
+    
+    a_query_engine = QueryEngine(architect_llm)
+    w_query_engine = QueryEngine(worker_llm)
 
     def _truncate_tool_messages(msgs: list) -> list:
         """
@@ -339,7 +342,7 @@ def build_graph(
                 usage["total_tokens"] = getattr(meta, "total_tokens", 0)
         return usage
 
-    def architect_node(state: AgentState) -> dict:
+    async def architect_node(state: AgentState) -> dict:
         messages = state.messages
         SUMMARIZE_AFTER_TURNS = 10
         non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
@@ -368,11 +371,11 @@ def build_graph(
         msgs = _compress_history(msgs)
 
         logger.info(f"🧠 Architect Reasoning — step {total_steps + 1}")
-        response = architect_llm.invoke(msgs)
+        response = await a_query_engine.query(msgs)
         usage = _extract_token_usage(response)
         return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
-    def worker_node(state: AgentState) -> dict:
+    async def worker_node(state: AgentState) -> dict:
         logger.info(f'⚡ WORKER NODE CALLED — messages count: {len(state.messages)}')
         messages = state.messages
         SUMMARIZE_AFTER_TURNS = 10
@@ -429,7 +432,7 @@ def build_graph(
         msgs = _compress_history(msgs)
 
         logger.info(f"⚡ Worker Executing — step {total_steps + 1}")
-        response = worker_llm.invoke(msgs)
+        response = await w_query_engine.query(msgs)
         usage = _extract_token_usage(response)
 
         modified_files = getattr(state, "modified_files", []) or []
