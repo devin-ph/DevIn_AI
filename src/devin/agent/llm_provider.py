@@ -27,7 +27,7 @@ def create_llm(
 
     # Use OpenRouter if OPENROUTER_API_KEY exists and the model isn't strictly OpenAI/Anthropic/Google specific
     # Or just fallback to the specific logic
-    if getattr(settings, "openrouter_api_key", None):
+    if getattr(settings, "openrouter_api_key", None) and "/" in model:
         return _create_openrouter(model, temperature, streaming, **kwargs)
         
     if _is_google_model(model):
@@ -36,12 +36,16 @@ def create_llm(
         return _create_openai(model, temperature, streaming, **kwargs)
     elif _is_anthropic_model(model):
         return _create_anthropic(model, temperature, streaming, **kwargs)
+    elif _is_groq_model(model):
+        return _create_groq(model, temperature, streaming, **kwargs)
     else:
         provider = settings.get_available_provider()
         if provider == "google":
             return _create_google(model, temperature, streaming, **kwargs)
         elif provider == "openai":
             return _create_openai(model, temperature, streaming, **kwargs)
+        elif provider == "groq":
+            return _create_groq(model, temperature, streaming, **kwargs)
         else:
             return _create_anthropic(model, temperature, streaming, **kwargs)
 
@@ -56,6 +60,11 @@ def _is_openai_model(model: str) -> bool:
 
 def _is_anthropic_model(model: str) -> bool:
     return model.startswith("claude-")
+
+def _is_groq_model(model: str) -> bool:
+    if model.startswith("groq/"):
+        return True
+    return any(model.startswith(prefix) for prefix in ["llama", "mixtral", "gemma"])
 
 def _create_openrouter(
     model: str, temperature: float, streaming: bool, **kwargs
@@ -131,5 +140,25 @@ def _create_anthropic(
         temperature=temperature,
         streaming=streaming,
         api_key=settings.anthropic_api_key,
+        model_kwargs={"extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"}},
         **kwargs,
     )
+
+def _create_groq(
+    model: str, temperature: float, streaming: bool, **kwargs
+) -> BaseChatModel:
+    """Create a Groq chat model."""
+    from langchain_groq import ChatGroq
+
+    if not settings.has_groq():
+        raise ValueError("Groq API key not configured. Set GROQ_API_KEY in .env")
+
+    logger.info(f"Creating Groq LLM: {model}")
+    return ChatGroq(
+        model=model,
+        temperature=temperature,
+        streaming=streaming,
+        api_key=settings.groq_api_key,
+        **kwargs,
+    )
+

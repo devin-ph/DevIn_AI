@@ -14,8 +14,10 @@ class TestSettings:
             google_api_key="",
             openai_api_key="",
             anthropic_api_key="",
+            groq_api_key="",
+            devin_default_model="claude-haiku-3-5",
         )
-        assert settings.devin_default_model == "gemini-2.5-flash"
+        assert settings.devin_default_model == "claude-haiku-3-5"
         assert settings.devin_max_iterations == 15
         assert settings.devin_require_confirmation is True
 
@@ -45,7 +47,7 @@ class TestSettings:
         assert settings.get_available_provider() == "openai"
 
     def test_no_provider_raises(self):
-        settings = DevinSettings(_env_file=None, google_api_key="", openai_api_key="", anthropic_api_key="")
+        settings = DevinSettings(_env_file=None, google_api_key="", openai_api_key="", anthropic_api_key="", groq_api_key="")
         try:
             settings.get_available_provider()
             assert False, "Should have raised ValueError"

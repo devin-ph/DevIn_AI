@@ -53,7 +53,12 @@ def write_file(filepath: str, content: str) -> str:
         # Ensure parents exist
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return f"Success: Wrote {len(content)} characters to {filepath}."
+        result = f"Success: Wrote {len(content)} characters to {filepath}."
+        if filepath.endswith(".py"):
+            check_res = self_check_file.invoke({"filepath": filepath})
+            if "FAIL" in check_res:
+                result += f"\nNote: self_check_file detected an issue:\n{check_res}"
+        return result
     except Exception as e:
         return f"Error writing file: {e}"
 
@@ -236,7 +241,12 @@ def edit_file_replace(filepath: str, old_str: str, new_str: str) -> str:
         if occurrences == 1:
             new_content = content.replace(old_str, new_str)
             path.write_text(new_content, encoding="utf-8")
-            return f"Success: Replaced 1 occurrence in {filepath}."
+            result = f"Success: Replaced 1 occurrence in {filepath}."
+            if filepath.endswith(".py"):
+                check_res = self_check_file.invoke({"filepath": filepath})
+                if "FAIL" in check_res:
+                    result += f"\nNote: self_check_file detected an issue:\n{check_res}"
+            return result
             
         elif occurrences > 1:
             return f"Error: old_str found {occurrences} times in the file. Please provide a more specific old_str (include more surrounding lines)."
@@ -260,7 +270,12 @@ def edit_file_replace(filepath: str, old_str: str, new_str: str) -> str:
         new_content = content.replace(match_str, new_str)
         path.write_text(new_content, encoding="utf-8")
         
-        return f"Success: Replaced 1 occurrence using fuzzy match in {filepath}."
+        result = f"Success: Replaced 1 occurrence using fuzzy match in {filepath}."
+        if filepath.endswith(".py"):
+            check_res = self_check_file.invoke({"filepath": filepath})
+            if "FAIL" in check_res:
+                result += f"\nNote: self_check_file detected an issue:\n{check_res}"
+        return result
         
     except Exception as e:
         return f"Error editing file: {e}"

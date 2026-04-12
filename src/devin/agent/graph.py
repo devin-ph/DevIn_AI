@@ -33,17 +33,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 # Skill loading priority and triggers
 SKILL_LOAD_RULES = {
-    "WHO_YOU_ARE.md":        ["*"],        # Always load (small, identity-critical)
-    "ESCALATION_POLICY.md": ["*"],        # Always load (safety-critical)
-    "CODE_STYLE.md":        [             # Load only for code tasks
-        "write", "create", "edit", "code", "function", "class",
-        "def ", "import", "fix", "bug", "refactor", "implement"
-    ],
-    "TASK_DECOMPOSITION.md": [            # Load only for multi-step tasks
-        "create", "build", "implement", "refactor", "fix",
-        "add feature", "make", "develop", "setup", "configure"
-    ],
-    "MEMORY_PROTOCOL.md":   [],           # Never auto-load (load on demand)
+    "WHO_YOU_ARE.md":        ["*"],
+    "ESCALATION_POLICY.md":  ["*"],
+    "CODE_STYLE.md":         ["write","create","edit","code","fix","class","def"],
+    "TASK_DECOMPOSITION.md": ["create","build","implement","refactor","fix"],
+    "MEMORY_PROTOCOL.md":    [],
 }
 
 def _load_relevant_skills(user_message: str, skills_dir: str) -> str:
@@ -76,36 +70,38 @@ def _load_relevant_skills(user_message: str, skills_dir: str) -> str:
     return content
 
 def _build_smart_tree(root_path: str, max_depth: int = 2, max_files_per_dir: int = 8) -> str:
-    """Build a concise project tree — depth-limited and file-count-limited."""
+    """Build a concise project tree — depth-limited and file-count-limited using os.walk."""
+    root_path = os.path.abspath(root_path)
     IGNORE = {'.git', '__pycache__', '.venv', 'node_modules', '.pytest_cache', 
-              'dist', 'build', '.eggs', '*.egg-info'}
+              'dist', 'build', '.eggs', '.egg-info'}
+    
     lines = []
-    root = Path(root_path).resolve()
     
-    def _walk(path: Path, depth: int):
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # Filter directories mapped back to original dirnames to trim traversal
+        dirnames[:] = sorted([d for d in dirnames if not any(d.endswith(ig.strip('*')) if ig.startswith('*') else d == ig for ig in IGNORE) and not d.startswith('.')])
+        filenames = sorted([f for f in filenames if not f.startswith('.')])
+        
+        # Calculate depth
+        rel_path = os.path.relpath(dirpath, root_path)
+        depth = 0 if rel_path == '.' else len(rel_path.split(os.sep))
+        
         if depth > max_depth:
-            return
-        try:
-            entries = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name))
-        except PermissionError:
-            return
-        
-        dirs = [e for e in entries if e.is_dir() and e.name not in IGNORE]
-        files = [e for e in entries if e.is_file() and not e.name.startswith('.')]
-        
-        for f in files[:max_files_per_dir]:
-            indent = "  " * depth
-            lines.append(f"{indent}📄 {f.name}")
-        if len(files) > max_files_per_dir:
-            lines.append(f"{'  ' * depth}  ... [{len(files) - max_files_per_dir} more files]")
-        
-        for d in dirs:
-            indent = "  " * depth
-            lines.append(f"{indent}📁 {d.name}/")
-            _walk(d, depth + 1)
-    
-    _walk(root, 0)
-    
+            dirnames[:] = []  # Stop traversing deeper
+            continue
+            
+        indent = "  " * depth
+        if depth == 0:
+            lines.append(f"📁 {os.path.basename(root_path)}/")
+        else:
+            lines.append(f"{indent}📁 {os.path.basename(dirpath)}/")
+            
+        # File listing with limit
+        for f in filenames[:max_files_per_dir]:
+            lines.append(f"{indent}  📄 {f}")
+        if len(filenames) > max_files_per_dir:
+            lines.append(f"{indent}    ... [{len(filenames) - max_files_per_dir} more files]")
+            
     result = "\n".join(lines)
     if len(result) > 1500:
         result = result[:1500] + "\n... [tree truncated]"

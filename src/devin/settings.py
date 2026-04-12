@@ -23,6 +23,7 @@ class DevinSettings(BaseSettings):
     google_api_key: str = ""           # FREE — Google Gemini
     openai_api_key: str = ""           # Optional (paid)
     anthropic_api_key: str = ""        # Optional (paid)
+    groq_api_key: str = ""             # Optional (freemium/paid)
     devin_default_model: str = "gemini-2.0-flash"
 
     # --- Search ---
@@ -62,6 +63,12 @@ class DevinSettings(BaseSettings):
             and self.anthropic_api_key != "sk-ant-your-anthropic-key-here"
         )
 
+    def has_groq(self) -> bool:
+        return bool(
+            self.groq_api_key
+            and self.groq_api_key != "gsk_your-groq-key-here"
+        )
+
     def get_available_provider(self) -> str:
         """Return the best available LLM provider. Prefers free (Google) first."""
         model = self.devin_default_model.lower()
@@ -74,18 +81,21 @@ class DevinSettings(BaseSettings):
                 return "openai"
         if "claude" in model and self.has_anthropic():
             return "anthropic"
+        if ("llama" in model or "mixtral" in model or "gemma" in model) and self.has_groq():
+            return "groq"
 
         # Auto-detect: prefer free providers first
         if self.has_google():
             return "google"
+        if self.has_groq():
+            return "groq"
         if self.has_openai():
             return "openai"
         if self.has_anthropic():
             return "anthropic"
 
         raise ValueError(
-            "No LLM provider configured. Set GOOGLE_API_KEY in .env\n"
-            "Get a free key at: https://aistudio.google.com/apikey"
+            "No LLM provider configured. Set GOOGLE_API_KEY or GROQ_API_KEY in .env"
         )
 
 

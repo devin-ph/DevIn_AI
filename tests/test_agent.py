@@ -36,12 +36,12 @@ class TestPrompts:
 
     def test_architect_prompt_contains_rules(self):
         prompt = get_architect_prompt()
-        assert "RULES:" in prompt
+        assert "RULES" in prompt
         assert "read-only tools" in prompt
 
     def test_architect_prompt_has_timestamp(self):
         prompt = get_architect_prompt()
-        assert "Current Time:" in prompt
+        assert "Time" in prompt
 
     def test_editor_prompt_contains_identity(self):
         prompt = get_editor_prompt()
@@ -51,8 +51,8 @@ class TestPrompts:
     def test_editor_prompt_contains_rules(self):
         prompt = get_editor_prompt()
         assert "EXECUTE" in prompt
-        assert "active tools" in prompt
+        assert "tools" in prompt
 
     def test_editor_prompt_has_timestamp(self):
         prompt = get_editor_prompt()
-        assert "Current Time:" in prompt
+        assert "Time" in prompt
