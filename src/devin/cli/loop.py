@@ -113,6 +113,7 @@ async def run_cli_async():
                     interaction_logger.log("assistant", response_text, {"fast_path": True})
                     conversation.append(AIMessage(content=response_text))
                     print_response(response_text)
+                    if hasattr(quick_response, 'usage_metadata'): print_token_summary(quick_response.usage_metadata)
                     continue
                 except Exception as e:
                     logger.debug(f"Fast path failed, falling back to full graph: {e}")
@@ -132,6 +133,9 @@ async def run_cli_async():
                     already_rendered = stream_res["already_rendered"]
                     iteration = stream_res["iteration"]
                     total_token_usage = stream_res["total_token_usage"]
+                    
+                    if stream_res.get("updated_conversation") is not None:
+                        conversation = stream_res["updated_conversation"]
 
                 except Exception as e:
                     agent_status.stop()

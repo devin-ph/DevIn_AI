@@ -40,22 +40,43 @@ def _load_relevant_skills(user_message: str, skills_dir: str) -> str:
     content = ""
     loaded = []
     
-    for filename, triggers in SKILL_LOAD_RULES.items():
-        filepath = os.path.join(skills_dir, filename)
-        if not os.path.exists(filepath):
+    # Static rules for known skills
+    STATIC_RULES = {
+        "WHO_YOU_ARE.md":        ["*"],
+        "ESCALATION_POLICY.md":  ["*"],
+        "CODE_STYLE.md":         ["write","create","edit","code","fix"],
+        "TASK_DECOMPOSITION.md": ["create","build","implement","refactor"],
+        "MEMORY_PROTOCOL.md":    [],
+    }
+    
+    # Dynamic: auto-generated skills always load for Python tasks
+    AUTO_GENERATED_TRIGGERS = ["write","create","edit","code",
+                                "fix","def","class","python",".py"]
+    
+    for filename in os.listdir(skills_dir):
+        if not filename.endswith(".md"):
             continue
         
-        should_load = (
-            triggers == ["*"] or
-            any(trigger in msg_lower for trigger in triggers)
-        )
+        filepath = os.path.join(skills_dir, filename)
+        
+        # Check static rules first
+        if filename in STATIC_RULES:
+            triggers = STATIC_RULES[filename]
+            should_load = (
+                triggers == ["*"] or
+                any(t in msg_lower for t in triggers)
+            )
+        else:
+            # Auto-generated skill: load for Python-related tasks
+            should_load = any(
+                t in msg_lower for t in AUTO_GENERATED_TRIGGERS
+            )
         
         if should_load:
             with open(filepath, "r", encoding="utf-8") as f:
                 skill_content = f.read()
-                # Truncate individual skills to 2000 chars max
                 if len(skill_content) > 2000:
-                    skill_content = skill_content[:2000] + "\n... [truncated]"
+                    skill_content = skill_content[:2000] + "\n...[truncated]"
                 content += f"\n--- {filename} ---\n{skill_content}\n"
                 loaded.append(filename)
     
@@ -182,13 +203,22 @@ logger = logging.getLogger(__name__)
 import subprocess
 import os
 
+from dataclasses import dataclass
+
+@dataclass
+class WorkerBrief:
+    task: str           # What to do
+    files: list[str]    # Which files are involved  
+    context: str        # Relevant snippets only
+    constraints: str    # From active skills
+
 @tool
-def delegate_to_worker(instructions: str) -> str:
+def delegate_to_worker(task: str, files: list[str], context: str, constraints: str) -> str:
     """
     Delegate the execution of tasks to the Worker sub-agent.
-    Provide highly detailed, step-by-step instructions for what the Worker needs to do.
+    You MUST provide task (what to do), files (which are involved), context (relevant snippets only), and constraints (from active skills).
     """
-    return f"Delegated to Worker successfully. THE WORKER IS NOW EXECUTING: {instructions}"
+    return f"Delegated to Worker successfully. The worker has started."
 
 def build_graph(
     registry: ToolRegistry | None = None,
@@ -344,6 +374,30 @@ def build_graph(
 
     async def architect_node(state: AgentState) -> dict:
         messages = state.messages
+
+        # FILTER WORKER CONTEXT: Hides Worker's intermediate tools, only exposes summary.
+        filtered_msgs = []
+        in_worker_phase = False
+        from langchain_core.messages import SystemMessage, ToolMessage, AIMessage, HumanMessage
+        
+        for m in messages:
+            if getattr(m, "name", "") == "delegate_to_worker" and isinstance(m, ToolMessage):
+                filtered_msgs.append(m)
+                in_worker_phase = True
+                continue
+                
+            if in_worker_phase:
+                if isinstance(m, AIMessage) and not m.tool_calls:
+                    # Worker finished, returning summary
+                    filtered_msgs.append(HumanMessage(content=f"Worker Execution Completed:\n{m.content}"))
+                    in_worker_phase = False
+                # Skip ALL other worker messages (tools, etc.)
+                continue
+                
+            filtered_msgs.append(m)
+            
+        messages = filtered_msgs
+
         SUMMARIZE_AFTER_TURNS = 10
         non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
         if non_system_count > SUMMARIZE_AFTER_TURNS:
@@ -376,14 +430,34 @@ def build_graph(
         return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
     async def worker_node(state: AgentState) -> dict:
-        logger.info(f'⚡ WORKER NODE CALLED — messages count: {len(state.messages)}')
-        messages = state.messages
-        SUMMARIZE_AFTER_TURNS = 10
-        non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
-        if non_system_count > SUMMARIZE_AFTER_TURNS:
-            logger.info(f"Summarizing history: {non_system_count} messages → compressed")
-            messages = _summarize_history(list(messages), keep_recent=4)
+        msgs_all = state.messages
+        # ISOLATE WORKER CONTEXT
+        # Find the last delegate_to_worker tool call in Architect's history
+        
+        args = {}
+        for m in reversed(msgs_all):
+            if hasattr(m, "tool_calls") and m.tool_calls:
+                for tc in m.tool_calls:
+                    if tc["name"] == "delegate_to_worker":
+                        args = tc.get("args", {})
+                        break
+            if args: break
             
+        t = args.get("task", "")
+        f = args.get("files", "")
+        c = args.get("context", "")
+        cs = args.get("constraints", "")
+        instructions = f"TASK:\n{t}\n\nFILES:\n{f}\n\nCONTEXT:\n{c}\n\nCONSTRAINTS:\n{cs}"
+
+        # Get all Worker messages (everything AFTER the delegate_to_worker ToolMessage)
+        worker_recent_msgs = []
+        found = False
+        for m in msgs_all:
+            if found:
+                worker_recent_msgs.append(m)
+            elif getattr(m, "name", "") == "delegate_to_worker" and isinstance(m, ToolMessage):
+                found = True
+
         iteration = state.iteration_count
         total_steps = state.total_steps
         tree = state.project_tree
@@ -396,13 +470,6 @@ def build_graph(
             with open(bugs_path, "r", encoding="utf-8") as f:
                 bugs_content = f.read()
 
-        # Look for the last delegation instructions
-        instructions = ""
-        for m in reversed(messages):
-            if isinstance(m, ToolMessage) and m.name == "delegate_to_worker":
-                instructions = m.content
-                break
-
         prompt = get_worker_prompt(
             instructions=instructions, 
             project_tree=tree,
@@ -411,27 +478,13 @@ def build_graph(
             project_rules=state.project_rules,
             bugs_content=bugs_content,
         )
-        msgs = [SystemMessage(content=prompt)] + list(messages)
+        
+        # Worker gets isolated context!
+        msgs = [SystemMessage(content=prompt)] + worker_recent_msgs
+        
+        msgs = _truncate_tool_messages(msgs)
 
-        # Remove the delegate_to_worker tool call so the LLM does not think it is the Architect
-        cleaned_msgs = []
-        from langchain_core.messages import AIMessage, HumanMessage
-
-        for m in msgs:
-            if isinstance(m, AIMessage) and m.tool_calls:
-                new_tcs = [tc for tc in m.tool_calls if tc["name"] != "delegate_to_worker"]
-                if len(new_tcs) != len(m.tool_calls):
-                    cleaned_msgs.append(AIMessage(content=m.content, tool_calls=new_tcs))
-                    continue
-            if isinstance(m, ToolMessage) and m.name == "delegate_to_worker":
-                cleaned_msgs.append(HumanMessage(content=f"ARCHITECT DELEGATION INSTRUCTIONS:\n{m.content}"))
-                continue
-            cleaned_msgs.append(m)
-
-        msgs = _truncate_tool_messages(cleaned_msgs)
-        msgs = _compress_history(msgs)
-
-        logger.info(f"⚡ Worker Executing — step {total_steps + 1}")
+        logger.info(f"⚡ Worker Executing (Isolated context: {len(msgs)} msgs) — step {total_steps + 1}")
         response = await w_query_engine.query(msgs)
         usage = _extract_token_usage(response)
 
@@ -471,29 +524,94 @@ def build_graph(
 
         return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage, "modified_files": []}
 
-    def _track_learning_loop(tool_name: str, error_msg: str, args: str):
+    def _track_learning_loop(tool_name: str, error_msg: str, args: str, root_cause: str = "Pending", fix: str = "Pending"):
         import os
         from datetime import datetime
+        from pathlib import Path
         pattern = error_msg.split('\n')[0][:80] if error_msg else "Unknown error"
-        entry_str = f"[{datetime.now().strftime('%Y-%m')}] {tool_name}: {pattern} → Root cause: Pending → Fix: Pending"
+        entry_str = f"[{datetime.now().strftime('%Y-%m')}] {tool_name}: {pattern} → Root cause: {root_cause} → Fix: {fix}"
         
         bugs_path = os.path.join("data", "memory", "bugs.md")
         os.makedirs(os.path.dirname(bugs_path), exist_ok=True)
         count = 0
+        content = ""
+        resolved_marker = f"[RESOLVED] {pattern[:40]}"
         if os.path.exists(bugs_path):
             with open(bugs_path, "r", encoding="utf-8") as f:
                 content = f.read()
+                if resolved_marker in content:
+                    return # Already resolved with a skill
                 count = content.count(pattern[:40])
                 
-        with open(bugs_path, "a", encoding="utf-8") as f:
-            f.write(f"\n{entry_str}\n")
+        # Deduplication check: only write if NOT pending AND it's not a duplicate
+        if root_cause != "Pending":
+            if entry_str not in content:
+                with open(bugs_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{entry_str}\n")
+        else:
+            # We don't write pending entries, but we still track count for learning loop
+            pass
             
-        if count >= 2: # 3rd time (since we append after checking count)
+        if count >= 2: # 3rd time
             print(f"\n[devin.system]⚠️ DevIn Learning Loop: I've encountered '{pattern[:40]}...' {count+1} times.[/]")
             try:
                 ans = input("   Create a skill to prevent this? [Y/n]: ").strip().lower()
-                if ans in ("", "y", "yes"):
-                    print("   [devin.system]Noted. A skill will be drafted (Phase 5 placeholder).[/]")
+                if ans in ("y", "yes", ""):
+                    # Extract the actual flake8 error pattern from bug history
+                    skill_name = "FLAKE8_COMMON_ERRORS.md"
+                    skill_path = Path("src/devin/skills") / skill_name
+                    
+                    # Read bugs.md to get the actual pattern
+                    bugs_path = Path("data/memory/bugs.md")
+                    bug_context = ""
+                    if bugs_path.exists():
+                        bug_context = bugs_path.read_text(encoding="utf-8")[-500:]
+                    
+                    skill_content = f"""# FLAKE8_COMMON_ERRORS — Auto-generated Skill
+
+## When to Use This Skill
+Load when writing or editing any Python file.
+
+## Pattern That Triggered This Skill
+This skill was auto-generated after encountering the same flake8
+issue 3+ times:
+{bug_context or "flake8 style warnings on Python files"}
+
+## Rules to Follow
+- Always add a newline at end of file
+- Maximum line length: 100 characters
+- No unused imports
+- No trailing whitespace
+- Use double quotes for strings consistently
+
+## Examples
+✅ Correct:
+def add(a: int, b: int) -> int:
+    return a + b
+
+❌ Wrong:
+def add(a,b):
+  return a+b
+
+## Auto-generated
+Date: {datetime.now().strftime("%Y-%m-%d")}
+Trigger: flake8 warnings encountered 3+ times
+"""
+                    
+                    skill_path.parent.mkdir(parents=True, exist_ok=True)
+                    skill_path.write_text(skill_content, encoding="utf-8")
+                    
+                    from devin.agent.memory import MemoryEngine
+                    memory_engine = MemoryEngine()
+                    memory_engine.mark_pattern_resolved("flake8", skill_name)
+                    
+                    with open(bugs_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n{resolved_marker} → skill created: {skill_name}\n")
+                        
+                    from devin.cli.renderer import console
+                    console.print(f"  [green]✅ Skill created: {skill_name}[/]")
+                    console.print(f"  [dim]Location: {skill_path}[/]")
+                    console.print(f"  [dim]This skill will auto-load for future Python tasks.[/]")
             except (EOFError, KeyboardInterrupt):
                 pass
 
@@ -530,10 +648,10 @@ def build_graph(
         tool_calls = getattr(last_msg, "tool_calls", [])
         
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("DEVIN_AUTO_APPROVE") == "1":
-            return _get_modified(tool_calls, ToolNode(worker_tools).invoke(state))
+            return _get_modified(tool_calls, ToolNode(w_tools).invoke(state))
             
         if not tool_calls:
-            return ToolNode(worker_tools).invoke(state)
+            return ToolNode(w_tools).invoke(state)
             
         import json
         from pathlib import Path
@@ -542,22 +660,22 @@ def build_graph(
                 filepath = tc["args"].get("filepath", "")
                 
                 # Show git diff if file exists (before showing consent)
-                if filepath and Path(filepath).exists() and tc["name"] in ("write_file", "edit_file_replace"):
-                    diff_result = subprocess.run(
-                        ["git", "diff", "HEAD", filepath],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if diff_result.stdout.strip():
-                        print(f"\n📄 Current diff for {filepath}:")
-                        # Print first 30 lines of diff
-                        diff_lines = diff_result.stdout.strip().splitlines()[:30]
-                        for line in diff_lines:
-                            if line.startswith("+"):
-                                print(f"  \033[32m{line}\033[0m")  # green
-                            elif line.startswith("-"):
-                                print(f"  \033[31m{line}\033[0m")  # red
-                            else:
-                                print(f"  {line}")
+                if tc["name"] == "edit_file_replace":
+                    filepath = tc["args"].get("filepath", "")
+                    if filepath and Path(filepath).exists():
+                        diff = subprocess.run(
+                            ["git", "diff", "HEAD", filepath],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if diff.stdout.strip():
+                            print(f"\n📄 Changes to {filepath}:")
+                            for line in diff.stdout.strip().splitlines()[:30]:
+                                if line.startswith("+") and not line.startswith("+++"):
+                                    print(f"  \033[32m{line}\033[0m")
+                                elif line.startswith("-") and not line.startswith("---"):
+                                    print(f"  \033[31m{line}\033[0m")
+                                else:
+                                    print(f"  {line}")
                 
                 args_str = json.dumps(tc["args"], indent=2, ensure_ascii=False)
                 print(f"\n⚠️  DevIn wants to run: {tc['name']}")
@@ -581,7 +699,7 @@ def build_graph(
                         ))
                     return {"messages": tool_messages}
                 
-        return _get_modified(tool_calls, ToolNode(worker_tools).invoke({"messages": state.messages}))
+        return _get_modified(tool_calls, ToolNode(w_tools).invoke({"messages": state.messages}))
 
     workflow.add_node("worker", worker_node)
     workflow.add_node("worker_tools", worker_tools_wrapper)
