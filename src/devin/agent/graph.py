@@ -31,14 +31,7 @@ import os
 from pathlib import Path
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-# Skill loading priority and triggers
-SKILL_LOAD_RULES = {
-    "WHO_YOU_ARE.md":        ["*"],
-    "ESCALATION_POLICY.md":  ["*"],
-    "CODE_STYLE.md":         ["write","create","edit","code","fix","class","def"],
-    "TASK_DECOMPOSITION.md": ["create","build","implement","refactor","fix"],
-    "MEMORY_PROTOCOL.md":    [],
-}
+from devin.constants import SKILL_LOAD_RULES, MUTATION_TOOLS
 
 def _load_relevant_skills(user_message: str, skills_dir: str) -> str:
     """Load only skills relevant to the current request."""
@@ -178,8 +171,7 @@ from langchain_core.tools import tool
 from devin.agent.llm_provider import create_llm
 from devin.agent.prompts import (
     get_architect_prompt,
-    get_editor_prompt,
-    get_validator_prompt,
+    get_worker_prompt,
 )
 from devin.agent.state import AgentState
 from devin.settings import settings
@@ -191,12 +183,12 @@ import subprocess
 import os
 
 @tool
-def delegate_to_editor(instructions: str) -> str:
+def delegate_to_worker(instructions: str) -> str:
     """
-    Delegate the execution of tasks to the Editor sub-agent.
-    Provide highly detailed, step-by-step instructions for what the Editor needs to do.
+    Delegate the execution of tasks to the Worker sub-agent.
+    Provide highly detailed, step-by-step instructions for what the Worker needs to do.
     """
-    return f"Delegated to Editor successfully. THE EDITOR IS NOW EXECUTING: {instructions}"
+    return f"Delegated to Worker successfully. THE WORKER IS NOW EXECUTING: {instructions}"
 
 def build_graph(
     registry: ToolRegistry | None = None,
@@ -215,17 +207,17 @@ def build_graph(
     
     # Categorize tools
     architect_tool_names = ["read_file", "list_directory", "web_search", "get_current_time", "file_search", "grep_search", "analyze_python_ast", "git_diff", "git_status"]
-    editor_tool_names = ["write_file", "edit_file_replace", "execute_command", "calculator", "get_current_time", "read_file", "file_search", "grep_search", "analyze_python_ast", "git_diff", "git_status", "self_check_file"]
+    worker_tool_names = ["write_file", "edit_file_replace", "execute_command", "calculator", "get_current_time", "read_file", "file_search", "grep_search", "analyze_python_ast", "git_diff", "git_status", "self_check_file"]
     
     a_tools = [t for t in all_tools if t.name in architect_tool_names]
-    a_tools.append(delegate_to_editor)
+    a_tools.append(delegate_to_worker)
     
-    e_tools = [t for t in all_tools if t.name in editor_tool_names]
+    w_tools = [t for t in all_tools if t.name in worker_tool_names]
 
     # Shared LLM backend
     # Adding .with_retry() to transparently handle OpenRouter 'Provider returned error' api drops
     architect_llm = create_llm(model=model).bind_tools(a_tools).with_retry(stop_after_attempt=4)
-    editor_llm = create_llm(model=model).bind_tools(e_tools).with_retry(stop_after_attempt=4)
+    worker_llm = create_llm(model=model).bind_tools(w_tools).with_retry(stop_after_attempt=4)
 
     def _truncate_tool_messages(msgs: list) -> list:
         """
@@ -303,14 +295,19 @@ def build_graph(
                 original_message = msg.content
                 break
 
+        # Load real session memory
+        from devin.agent.memory import MemoryEngine
+        memory_engine = MemoryEngine()
+        memory_content = memory_engine.load()
+
         skills_dir = os.path.join(os.path.dirname(__file__), "..", "skills")
         active_skills_content = _load_relevant_skills(original_message, skills_dir)
         
-        project_rules_content = ""
+        project_rules_content = memory_content + "\n\n"
         devin_md_path = os.path.join(os.getcwd(), "DEVIN.md")
         if os.path.exists(devin_md_path):
             with open(devin_md_path, "r", encoding="utf-8") as f:
-                project_rules_content = f.read()
+                project_rules_content += f.read()
                 
         # Truncate rules just in case DEVIN.md is large
         if len(project_rules_content) > 3000:
@@ -375,8 +372,8 @@ def build_graph(
         usage = _extract_token_usage(response)
         return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
-    def editor_node(state: AgentState) -> dict:
-        logger.info(f'⚡ EDITOR NODE CALLED — messages count: {len(state.messages)}')
+    def worker_node(state: AgentState) -> dict:
+        logger.info(f'⚡ WORKER NODE CALLED — messages count: {len(state.messages)}')
         messages = state.messages
         SUMMARIZE_AFTER_TURNS = 10
         non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
@@ -386,39 +383,44 @@ def build_graph(
             
         iteration = state.iteration_count
         total_steps = state.total_steps
-        feedback = state.verification_feedback
+        tree = state.project_tree
+
+        # Load bugs for Worker
+        import os
+        bugs_content = ""
+        bugs_path = os.path.join("data", "memory", "bugs.md")
+        if os.path.exists(bugs_path):
+            with open(bugs_path, "r", encoding="utf-8") as f:
+                bugs_content = f.read()
 
         # Look for the last delegation instructions
         instructions = ""
         for m in reversed(messages):
-            if isinstance(m, ToolMessage) and m.name == "delegate_to_editor":
+            if isinstance(m, ToolMessage) and m.name == "delegate_to_worker":
                 instructions = m.content
                 break
 
-        prompt = get_editor_prompt(
+        prompt = get_worker_prompt(
             instructions=instructions, 
-            feedback=feedback, 
+            project_tree=tree,
             total_steps=total_steps,
             active_skills=state.active_skills,
-            project_rules=state.project_rules
+            project_rules=state.project_rules,
+            bugs_content=bugs_content,
         )
+        msgs = [SystemMessage(content=prompt)] + list(messages)
 
-        if messages and isinstance(messages[0], SystemMessage):
-            msgs = [SystemMessage(content=prompt)] + list(messages[1:])
-        else:
-            msgs = [SystemMessage(content=prompt)] + list(messages)
-
-        # Remove the delegate_to_editor tool call so the LLM does not think it is the Architect
+        # Remove the delegate_to_worker tool call so the LLM does not think it is the Architect
         cleaned_msgs = []
         from langchain_core.messages import AIMessage, HumanMessage
 
         for m in msgs:
             if isinstance(m, AIMessage) and m.tool_calls:
-                new_tcs = [tc for tc in m.tool_calls if tc["name"] != "delegate_to_editor"]
+                new_tcs = [tc for tc in m.tool_calls if tc["name"] != "delegate_to_worker"]
                 if len(new_tcs) != len(m.tool_calls):
                     cleaned_msgs.append(AIMessage(content=m.content, tool_calls=new_tcs))
                     continue
-            if isinstance(m, ToolMessage) and m.name == "delegate_to_editor":
+            if isinstance(m, ToolMessage) and m.name == "delegate_to_worker":
                 cleaned_msgs.append(HumanMessage(content=f"ARCHITECT DELEGATION INSTRUCTIONS:\n{m.content}"))
                 continue
             cleaned_msgs.append(m)
@@ -426,46 +428,14 @@ def build_graph(
         msgs = _truncate_tool_messages(cleaned_msgs)
         msgs = _compress_history(msgs)
 
-        logger.info(f"⚡ Editor Executing — step {total_steps + 1}")
-        response = editor_llm.invoke(msgs)
+        logger.info(f"⚡ Worker Executing — step {total_steps + 1}")
+        response = worker_llm.invoke(msgs)
         usage = _extract_token_usage(response)
-        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage}
 
-    def validator_node(state: AgentState) -> dict:
-        messages = state.messages
-        SUMMARIZE_AFTER_TURNS = 10
-        non_system_count = sum(1 for m in messages if not isinstance(m, SystemMessage))
-        if non_system_count > SUMMARIZE_AFTER_TURNS:
-            logger.info(f"Summarizing history: {non_system_count} messages → compressed")
-            messages = _summarize_history(list(messages), keep_recent=4)
-            
-        total_steps = state.total_steps
-        tree = state.project_tree
         modified_files = getattr(state, "modified_files", []) or []
-
-        prompt = get_validator_prompt(
-            project_tree=tree, 
-            total_steps=total_steps,
-            active_skills=state.active_skills,
-            project_rules=state.project_rules
-        )
-
-        if messages and isinstance(messages[0], SystemMessage):
-            msgs = [SystemMessage(content=prompt)] + list(messages[1:])
-        else:
-            msgs = [SystemMessage(content=prompt)] + list(messages)
-
-        msgs = _truncate_tool_messages(msgs)
-        msgs = _compress_history(msgs)
-
-        logger.info(f"🔍 Validator Reviewing — step {total_steps + 1}")
-        response = architect_llm.invoke(msgs) # Validator uses Architect LLM for better reasoning
-        usage = _extract_token_usage(response)
-        
-        # Hard Validation block
-        import subprocess
         hard_feedback = []
         if modified_files:
+            import subprocess
             for filepath in modified_files:
                 if filepath.endswith(".py"):
                     try:
@@ -479,33 +449,50 @@ def build_graph(
                     except Exception:
                         pass
         
-        feedback = ""
-        content = getattr(response, "content", "").upper()
-        
-        is_fail = "FAIL" in content or len(hard_feedback) > 0
-        
+        is_fail = len(hard_feedback) > 0
         if is_fail:
-            feedback = response.content
-            if hard_feedback:
-                feedback += "\n\n" + "\n".join(hard_feedback)
-                if "FAIL" not in content:
-                    response = AIMessage(
-                        content="FAIL:\n" + response.content + "\n\n" + "\n".join(hard_feedback),
-                        id=response.id,
-                        name=response.name,
-                        tool_calls=response.tool_calls,
-                        response_metadata=response.response_metadata
-                    )
-                    
-        return {
-            "messages": [response], 
-            "total_steps": total_steps + 1,
-            "verification_feedback": feedback,
-            "modified_files": [],
-            "token_usage": usage
-        }
+            error_details = "\n".join(hard_feedback)
+            _track_learning_loop("worker_validation", error_details[:100], "")
+            from langchain_core.messages import AIMessage
+            
+            # Instead of replacing the AI's content, we simulate a SystemMessage giving it feedback, 
+            # or in this simple loop, we append it so the next iteration fixes it.
+            # To keep it simple, we wrap it into the response.
+            response = AIMessage(
+                content="VULNERABILITY DETECTED:\n" + error_details + "\n\n" + str(getattr(response, "content", "")),
+                id=getattr(response, "id", None),
+                name=getattr(response, "name", None),
+                tool_calls=getattr(response, "tool_calls", []),
+                response_metadata=getattr(response, "response_metadata", {})
+            )
 
-    # --- Assemble Graph ---
+        return {"messages": [response], "iteration_count": iteration + 1, "total_steps": total_steps + 1, "token_usage": usage, "modified_files": []}
+
+    def _track_learning_loop(tool_name: str, error_msg: str, args: str):
+        import os
+        from datetime import datetime
+        pattern = error_msg.split('\n')[0][:80] if error_msg else "Unknown error"
+        entry_str = f"[{datetime.now().strftime('%Y-%m')}] {tool_name}: {pattern} → Root cause: Pending → Fix: Pending"
+        
+        bugs_path = os.path.join("data", "memory", "bugs.md")
+        os.makedirs(os.path.dirname(bugs_path), exist_ok=True)
+        count = 0
+        if os.path.exists(bugs_path):
+            with open(bugs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                count = content.count(pattern[:40])
+                
+        with open(bugs_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{entry_str}\n")
+            
+        if count >= 2: # 3rd time (since we append after checking count)
+            print(f"\n[devin.system]⚠️ DevIn Learning Loop: I've encountered '{pattern[:40]}...' {count+1} times.[/]")
+            try:
+                ans = input("   Create a skill to prevent this? [Y/n]: ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    print("   [devin.system]Noted. A skill will be drafted (Phase 5 placeholder).[/]")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
     workflow = StateGraph(AgentState)
 
@@ -513,9 +500,7 @@ def build_graph(
     workflow.add_node("architect", architect_node)
     workflow.add_node("architect_tools", ToolNode(a_tools))
     
-    workflow.add_node("editor", editor_node)
-    
-    def editor_tools_wrapper(state: AgentState):
+    def worker_tools_wrapper(state: AgentState):
         last_msg = state.messages[-1]
         
         def _get_modified(tool_calls, result_state):
@@ -527,22 +512,30 @@ def build_graph(
                     if filepath and filepath not in new_files:
                         new_files.append(filepath)
             result_state["modified_files"] = new_files
+            
+            if "messages" in result_state:
+                msgs = result_state["messages"]
+                if not isinstance(msgs, list): msgs = [msgs]
+                for msg in msgs:
+                    if hasattr(msg, "content"):
+                        cont = str(msg.content)
+                        if "Error:" in cont or "FAIL" in cont or "Traceback" in cont:
+                            _track_learning_loop(getattr(msg, "name", "tool"), cont, "")
+                            
             return result_state
             
         tool_calls = getattr(last_msg, "tool_calls", [])
         
         if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("DEVIN_AUTO_APPROVE") == "1":
-            return _get_modified(tool_calls, ToolNode(e_tools).invoke(state))
+            return _get_modified(tool_calls, ToolNode(worker_tools).invoke(state))
             
-        mutation_tools = ["execute_command", "write_file", "edit_file_replace"]
-        
         if not tool_calls:
-            return ToolNode(e_tools).invoke(state)
+            return ToolNode(worker_tools).invoke(state)
             
         import json
         from pathlib import Path
         for tc in tool_calls:
-            if tc["name"] in mutation_tools:
+            if tc["name"] in MUTATION_TOOLS:
                 filepath = tc["args"].get("filepath", "")
                 
                 # Show git diff if file exists (before showing consent)
@@ -585,25 +578,23 @@ def build_graph(
                         ))
                     return {"messages": tool_messages}
                 
-        return _get_modified(tool_calls, ToolNode(e_tools).invoke({"messages": state.messages}))
+        return _get_modified(tool_calls, ToolNode(worker_tools).invoke({"messages": state.messages}))
 
-    workflow.add_node("editor_tools", editor_tools_wrapper)
-    workflow.add_node("validator", validator_node)
+    workflow.add_node("worker", worker_node)
+    workflow.add_node("worker_tools", worker_tools_wrapper)
 
     workflow.set_entry_point("initialize")
     
     workflow.add_edge("initialize", "architect")
 
     workflow.add_conditional_edges("architect", architect_should_continue, {"architect_tools": "architect_tools", "__end__": END})
-    workflow.add_conditional_edges("architect_tools", edge_after_architect_tools, {"editor": "editor", "architect": "architect"})
+    workflow.add_conditional_edges("architect_tools", edge_after_architect_tools, {"worker": "worker", "architect": "architect"})
     
-    workflow.add_conditional_edges("editor", editor_should_continue, {"editor_tools": "editor_tools", "validator": "validator", "architect": "architect"})
-    workflow.add_edge("editor_tools", "editor")
-
-    workflow.add_conditional_edges("validator", validator_should_continue, {"architect_tools": "architect_tools", "editor": "editor", "architect": "architect"})
+    workflow.add_conditional_edges("worker", worker_should_continue, {"worker_tools": "worker_tools", "architect": "architect"})
+    workflow.add_edge("worker_tools", "worker")
 
     compiled = workflow.compile()
-    logger.info("✅ Multi-Agent Graph Compiled (Verifying Architect)")
+    logger.info("✅ Multi-Agent Graph Compiled (Architect + Worker)")
 
     return compiled
 
@@ -613,7 +604,7 @@ def architect_should_continue(state: AgentState) -> Literal["architect_tools", "
     last = messages[-1]
     
     total_steps = state.total_steps
-    if total_steps >= 15: # Increased for verification loops
+    if total_steps >= 20: 
         logger.warning(f"CIRCUIT BREAKER: Max total steps ({total_steps}) hit. Stopping.")
         return "__end__"
         
@@ -621,49 +612,26 @@ def architect_should_continue(state: AgentState) -> Literal["architect_tools", "
         return "architect_tools"
     return "__end__"
 
-def edge_after_architect_tools(state: AgentState) -> Literal["editor", "architect"]:
+def edge_after_architect_tools(state: AgentState) -> Literal["worker", "architect"]:
     messages = state.messages
     if not messages: return "architect"
     last = messages[-1]
     
-    if isinstance(last, ToolMessage) and getattr(last, "name", "") == "delegate_to_editor":
-        return "editor"
+    if isinstance(last, ToolMessage) and getattr(last, "name", "") == "delegate_to_worker":
+        return "worker"
     return "architect"
 
-def editor_should_continue(state: AgentState) -> Literal["editor_tools", "validator", "architect"]:
+def worker_should_continue(state: AgentState) -> Literal["worker_tools", "architect"]:
     messages = state.messages
-    if not messages: return "validator"
+    if not messages: return "architect"
     last = messages[-1]
     
     total_steps = state.total_steps
-    if total_steps >= 30:
-        return "validator"
+    if total_steps >= 35:
+        return "architect"
         
     if isinstance(last, AIMessage) and last.tool_calls:
-        return "editor_tools"
-    
-    if not getattr(state, "modified_files", []):
-        return "architect"
-        
-    return "validator"
-
-def validator_should_continue(state: AgentState) -> Literal["architect_tools", "editor", "architect"]:
-    messages = state.messages
-    if not messages: return "architect"
-    last = messages[-1]
-
-    if not isinstance(last, AIMessage):
-        return "architect"
-
-    content = last.content.upper()
-    if last.tool_calls:
-        return "architect_tools"
-    
-    if "FAIL" in content:
-        # Pass feedback to editor
-        # Note: In a real graph we might use a dedicated state update, 
-        # but for now we'll rely on the LLM seeing it in history
-        return "editor"
+        return "worker_tools"
     
     return "architect"
 

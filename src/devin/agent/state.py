@@ -62,7 +62,6 @@ class AgentState:
     project_tree: str = ""
     active_skills: str = ""
     project_rules: str = ""
-    verification_feedback: str = ""
     modified_files: Annotated[list[str], _replace_or_add] = field(default_factory=list)
     tool_outputs: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None

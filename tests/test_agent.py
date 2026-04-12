@@ -2,7 +2,7 @@
 
 from langchain_core.messages import AIMessage
 from devin.agent.graph import architect_should_continue
-from devin.agent.prompts import get_architect_prompt, get_editor_prompt
+from devin.agent.prompts import get_architect_prompt, get_worker_prompt
 from devin.agent.state import AgentState
 
 
@@ -43,16 +43,16 @@ class TestPrompts:
         prompt = get_architect_prompt()
         assert "Time" in prompt
 
-    def test_editor_prompt_contains_identity(self):
-        prompt = get_editor_prompt()
+    def test_worker_prompt_contains_identity(self):
+        prompt = get_worker_prompt()
         assert "DevIn" in prompt
-        assert "Editor" in prompt
+        assert "Worker" in prompt
 
-    def test_editor_prompt_contains_rules(self):
-        prompt = get_editor_prompt()
-        assert "EXECUTE" in prompt
+    def test_worker_prompt_contains_rules(self):
+        prompt = get_worker_prompt()
+        assert "Worker" in prompt
         assert "tools" in prompt
 
-    def test_editor_prompt_has_timestamp(self):
-        prompt = get_editor_prompt()
+    def test_worker_prompt_has_timestamp(self):
+        prompt = get_worker_prompt()
         assert "Time" in prompt
