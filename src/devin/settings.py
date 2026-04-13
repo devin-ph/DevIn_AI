@@ -25,6 +25,9 @@ class DevinSettings(BaseSettings):
     anthropic_api_key: str = ""        # Optional (paid)
     groq_api_key: str = ""             # Optional (freemium/paid)
     devin_default_model: str = "gemini-2.0-flash"
+    devin_architect_model: str = ""   # e.g. claude-sonnet-4-5 for deep reasoning
+    devin_worker_model: str = ""      # e.g. claude-haiku-3-5 for fast execution
+    devin_companion_model: str = ""   # e.g. groq/llama-3.3-70b for life chat
 
     # --- Search ---
     tavily_api_key: str = ""           # Optional — DuckDuckGo is the free default

@@ -25,7 +25,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import os
 from pathlib import Path
@@ -200,6 +200,22 @@ from devin.tools.registry import ToolRegistry, create_default_registry
 
 logger = logging.getLogger(__name__)
 
+_companion_chain_factory: Callable[[], Any] | None = None
+
+
+def create_companion_chain() -> Any:
+    """Return the companion LLM configured by build_graph for life-chat flows."""
+    if _companion_chain_factory is not None:
+        return _companion_chain_factory()
+
+    companion_model = (
+        settings.devin_companion_model
+        or settings.devin_worker_model
+        or settings.devin_architect_model
+        or settings.devin_default_model
+    )
+    return create_llm(model=companion_model)
+
 import subprocess
 import os
 
@@ -246,8 +262,19 @@ def build_graph(
 
     from devin.agent.query import QueryEngine
 
-    architect_llm = create_llm(model=model).bind_tools(a_tools)
-    worker_llm = create_llm(model=model).bind_tools(w_tools)
+    architect_model = model or settings.devin_architect_model or settings.devin_default_model
+    worker_model = settings.devin_worker_model or architect_model
+    companion_model = settings.devin_companion_model or worker_model
+
+    architect_llm = create_llm(model=architect_model).bind_tools(a_tools)
+    worker_llm = create_llm(model=worker_model).bind_tools(w_tools)
+    companion_llm = create_llm(model=companion_model)
+
+    def _companion_chain() -> Any:
+        return companion_llm
+
+    global _companion_chain_factory
+    _companion_chain_factory = _companion_chain
     
     a_query_engine = QueryEngine(architect_llm)
     w_query_engine = QueryEngine(worker_llm)
@@ -275,42 +302,6 @@ def build_graph(
                     continue
             processed.append(m)
         return processed
-
-    def _compress_history(msgs: list) -> list:
-        """
-        Compresses long history preserving System Prompt, first Human message (goal), 
-        and last few turns. Replaces middle with a structured summary to save tokens.
-        """
-        if len(msgs) <= 10:
-            return msgs
-            
-        system_msgs = [m for m in msgs if isinstance(m, SystemMessage)]
-        other_msgs = [m for m in msgs if not isinstance(m, SystemMessage)]
-        
-        if len(other_msgs) <= 6:
-            return msgs
-            
-        first_human = other_msgs[0]
-        recent_msgs = other_msgs[-5:]
-        
-        # Count tool calls in omitted
-        omitted = other_msgs[1:-5]
-        tools_used = []
-        for m in omitted:
-            if isinstance(m, AIMessage) and m.tool_calls:
-                tools_used.extend([tc["name"] for tc in m.tool_calls])
-                
-        from collections import Counter
-        tool_counts = dict(Counter(tools_used))
-        
-        summary_text = f"[[CONTEXT COMPRESSED]]\n"
-        summary_text += f"{len(omitted)} intermediate messages were removed to save tokens.\n"
-        if tool_counts:
-            summary_text += f"Tools utilized in omitted history: {tool_counts}\n"
-            
-        summary_msg = SystemMessage(content=summary_text)
-        
-        return system_msgs + [first_human, summary_msg] + recent_msgs
 
     # --- Node Configurations ---
 
@@ -422,8 +413,9 @@ def build_graph(
             msgs = [SystemMessage(content=prompt)] + list(messages)
 
         msgs = _truncate_tool_messages(msgs)
-        msgs = _compress_history(msgs)
 
+        logger.info(f"🧠 Architect using model: {architect_model}")
+        logger.info(f"⚡ Worker using model: {worker_model}")
         logger.info(f"🧠 Architect Reasoning — step {total_steps + 1}")
         response = await a_query_engine.query(msgs)
         usage = _extract_token_usage(response)
@@ -531,9 +523,12 @@ def build_graph(
         pattern = error_msg.split('\n')[0][:80] if error_msg else "Unknown error"
         entry_str = f"[{datetime.now().strftime('%Y-%m')}] {tool_name}: {pattern} → Root cause: {root_cause} → Fix: {fix}"
         
+        from devin.agent.memory import MemoryEngine
+        memory_engine = MemoryEngine()
+        
         bugs_path = os.path.join("data", "memory", "bugs.md")
         os.makedirs(os.path.dirname(bugs_path), exist_ok=True)
-        count = 0
+        count = memory_engine.count_unresolved_pattern(pattern[:40])
         content = ""
         resolved_marker = f"[RESOLVED] {pattern[:40]}"
         if os.path.exists(bugs_path):
@@ -541,7 +536,6 @@ def build_graph(
                 content = f.read()
                 if resolved_marker in content:
                     return # Already resolved with a skill
-                count = content.count(pattern[:40])
                 
         # Deduplication check: only write if NOT pending AND it's not a duplicate
         if root_cause != "Pending":
