@@ -1,6 +1,25 @@
-# Environment
+# === SECRETS ===
 .env
 .env.local
+
+# === PERSONAL DATA (never publish) ===
+data/memory/life.md
+data/memory/daily.md
+data/memory/preferences.md
+data/memory/project_state.md
+data/memory/decisions.md
+data/memory/bugs.md
+data/memory/memory.md
+data/logs/*
+!data/logs/.gitkeep
+data/checkpoints/*
+!data/checkpoints/.gitkeep
+
+# === PERSONAL SKILLS ===
+src/devin/skills/WHO_YOU_ARE.md
+
+# === KEEP DIRECTORY STRUCTURE ===
+# (tracked via .gitkeep files)
 
 # Python
 __pycache__/
@@ -17,7 +36,6 @@ venv/
 env/
 
 # Data & Storage
-data/
 *.db
 *.sqlite
 
@@ -32,7 +50,7 @@ data/
 Thumbs.db
 
 # Logs
-logs/
+/logs/
 *.log
 
 # Testing
