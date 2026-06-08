@@ -4,19 +4,21 @@ DevIn CLI — Rich terminal interface for interacting with the agent.
 This is the primary user interface for DevIn through Phases 1-4.
 Features:
 - Rich formatted output with colors and panels
-- Real-time streaming of agent reasoning and tool calls
+- Real-time streaming of agent reasoning and tool calls with astream_events
 - Slash commands (/help, /clear, /debug, /exit)
 - Full conversation history
 - JSON logging of all interactions
+- Buffered <thought> tag parsing for clean visual rendering
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 import sys
 
-# Force UTF-8 rendering on Windows terminals to prevent rich crashes
 if hasattr(sys.stdout, 'reconfigure'):
     if sys.stdout.encoding != 'utf-8':
         sys.stdout.reconfigure(encoding='utf-8')
@@ -37,7 +39,6 @@ from rich.rule import Rule
 from rich.text import Text
 from rich.theme import Theme
 
-# --- Theme ---
 DEVIN_THEME = Theme(
     {
         "devin.name": "bold cyan",
@@ -54,15 +55,12 @@ DEVIN_THEME = Theme(
 
 console = Console(theme=DEVIN_THEME)
 
-# --- Logging setup ---
 logging.basicConfig(
     level=logging.WARNING,
     format="%(name)s | %(message)s",
 )
 logger = logging.getLogger("devin")
 
-
-# --- Slash Commands ---
 SLASH_COMMANDS = {
     "/help": "Show available commands",
     "/clear": "Clear the conversation history and start fresh",
@@ -73,8 +71,6 @@ SLASH_COMMANDS = {
     "/exit": "Exit DevIn",
     "/quit": "Exit DevIn",
 }
-
-# --- Interaction Logger ---
 class InteractionLogger:
     """Logs all conversations to a JSON file for analysis and memory training."""
 
@@ -92,12 +88,55 @@ class InteractionLogger:
             "metadata": metadata or {},
         }
         self.entries.append(entry)
-        # Append to file
         with open(self.session_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
 
-# --- Display Helpers ---
+class ThoughtBuffer:
+    """
+    Accumulates text chunks to cleanly parse <thought> XML tags.
+    Prevents broken tags (e.g., '<thou' + 'ght>') from rendering.
+    """
+
+    def __init__(self):
+        self.buffer = ""
+        self.complete_blocks: list[str] = []
+        self.display_text = ""
+
+    def add_chunk(self, chunk: str) -> str:
+        """
+        Add a chunk and return displayable text (without <thought> tags).
+        Accumulates chunks until <thought> tags are complete.
+        """
+        self.buffer += chunk
+        self._process_buffer()
+        return self.display_text
+
+    def _process_buffer(self):
+        """Extract complete <thought> blocks and update display text."""
+        self.complete_blocks = []
+        self.display_text = ""
+
+        thought_pattern = r'<thought>.*?</thought>'
+        for match in re.finditer(thought_pattern, self.buffer, re.DOTALL):
+            self.complete_blocks.append(match.group())
+
+        self.display_text = re.sub(thought_pattern, '', self.buffer, flags=re.DOTALL).strip()
+
+    def get_display_text(self) -> str:
+        """Get the current text without thought tags."""
+        return self.display_text
+
+    def get_complete_thoughts(self) -> list[str]:
+        """Get all complete thought blocks extracted so far."""
+        return self.complete_blocks
+
+    def finalize(self) -> tuple[str, list[str]]:
+        """
+        Get final display text and complete thoughts.
+        Handles any remaining partial content in buffer.
+        """
+        return self.get_display_text(), self.get_complete_thoughts()
 
 def print_banner():
     """Print the DevIn startup banner."""
@@ -129,7 +168,6 @@ def print_tool_call(name: str, args: dict):
     args_str = json.dumps(args, indent=2) if args else "{}"
     console.print(f"  [devin.tool_name]🔧 Using tool: {name}[/]")
     if args_str != "{}":
-        # Truncate long args for display
         display_args = args_str if len(args_str) < 300 else args_str[:300] + "\n  ..."
         console.print(f"  [devin.tool_input]{display_args}[/]")
 
@@ -138,14 +176,21 @@ def print_tool_result(content: str):
     """Display tool result (truncated)."""
     if len(content) > 500:
         content = content[:500] + "\n  ... (truncated)"
-    console.print(Panel(content, title="Tool Result", border_style="green", padding=(0, 1)))
+    console.print(f"  [bold green]✅ Tool Result:[/]\n  [dim]{content}[/]")
 
+
+def strip_thoughts(content: str) -> str:
+    clean = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL)
+    return clean.strip()
 
 def print_response(content: str):
     """Display the agent's final response as rendered markdown."""
+    clean_content = strip_thoughts(content)
+    if not clean_content:
+        return
     console.print()
     console.print(Panel(
-        Markdown(content),
+        Markdown(clean_content),
         title="[bold cyan]DevIn[/]",
         border_style="cyan",
         padding=(1, 2),
@@ -173,6 +218,53 @@ def handle_slash_command(
     cmd = command.strip().lower()
 
     if cmd in ("/exit", "/quit"):
+        if len(conversation) > 2:
+            try:
+                from devin.agent.memory import MemoryEngine
+                memory = MemoryEngine()
+                summary = memory.propose_save(conversation)
+                if any(v for v in summary.values() if v):
+                    console.print("\n🧠 Session Summary — Save to Memory?")
+                    for key, val in summary.items():
+                        if val:
+                            console.print(f"  {key.upper()}: {val}")
+                    console.print("\n  Save all / edit / skip?")
+                    try:
+                        choice = console.input("Choice ▶ ").strip().lower()
+                        if choice in ('', 'y', 'yes', 'save all', 'save', 'all'):
+                            memory.save(summary)
+                            console.print("  [green]✅ Memory saved.[/]")
+                        elif choice == 'skip':
+                            pass
+                        elif choice == 'edit':
+                            console.print("  [dim]Edit each section. Press Enter to keep current value.[/]")
+                            edited = {}
+                            if summary.get('state'):
+                                console.print(f"  PROJECT_STATE: {summary['state']}")
+                                new_val = console.input("  New value: ").strip()
+                                edited['state'] = new_val if new_val else summary['state']
+                            if summary.get('decisions'):
+                                console.print(f"  DECISIONS: {summary['decisions']}")
+                                new_val = console.input("  New value: ").strip()
+                                edited['decisions'] = new_val if new_val else summary['decisions']
+                            if summary.get('prefs'):
+                                console.print(f"  PREFERENCES: {summary['prefs']}")
+                                new_val = console.input("  New value: ").strip()
+                                edited['prefs'] = new_val if new_val else summary['prefs']
+                            if summary.get('bugs'):
+                                console.print(f"  BUGS: {summary['bugs']}")
+                                new_val = console.input("  New value: ").strip()
+                                edited['bugs'] = new_val if new_val else summary['bugs']
+                            
+                            console.print("\n  Save edited memory? [Y/n]: ")
+                            if console.input().strip().lower() in ('', 'y', 'yes'):
+                                memory.save(edited)
+                                console.print("  [green]✅ Edited memory saved.[/]")
+                    except (EOFError, KeyboardInterrupt):
+                        pass
+            except Exception as e:
+                logger.debug(f"Memory protocol failed: {e}")
+
         console.print("\n  [devin.system]👋 Goodbye! DevIn signing off.[/]\n")
         return conversation, debug_mode, False
 
@@ -235,15 +327,11 @@ def handle_slash_command(
 
     return conversation, debug_mode, True
 
-
-# --- Main Loop ---
-
-def run_cli():
-    """Run the DevIn interactive CLI."""
+async def run_cli_async():
+    """Run the DevIn interactive CLI with async streaming."""
     from devin.agent.graph import build_graph
     from devin.tools.registry import create_default_registry
 
-    # Initialize
     print_banner()
 
     try:
@@ -264,12 +352,20 @@ def run_cli():
     interaction_logger = InteractionLogger()
     conversation: list = []
     debug_mode = False
+    
+    session_cache = {
+        "project_tree": None,
+        "active_skills": None, 
+        "project_rules": None,
+    }
 
     while True:
         try:
-            # Get user input
             try:
-                user_input = console.input("[bold white]You ▶ [/]").strip()
+                user_input = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: console.input("[bold white]You ▶ [/]").strip()
+                )
             except (EOFError, KeyboardInterrupt):
                 console.print("\n  [devin.system]👋 Goodbye![/]\n")
                 break
@@ -277,7 +373,6 @@ def run_cli():
             if not user_input:
                 continue
 
-            # Handle slash commands
             if user_input.startswith("/"):
                 conversation, debug_mode, should_continue = handle_slash_command(
                     user_input, conversation, debug_mode, agent, registry
@@ -286,103 +381,151 @@ def run_cli():
                     break
                 continue
 
-            # Log the user message
             interaction_logger.log("user", user_input)
 
-            # Add to conversation
             user_message = HumanMessage(content=user_input)
             conversation.append(user_message)
 
             full_messages = conversation
 
-            console.print()  # spacing
+            console.print()
 
-            # --- Stream the agent execution ---
             try:
                 final_response = ""
+                already_rendered = False
                 iteration = 0
                 live_render = None
+                thought_buffer = ThoughtBuffer()
 
-                import re
+                try:
+                    state_input = {
+                        "messages": full_messages, 
+                        "iteration_count": 0,
+                    }
+                    if session_cache["project_tree"] is not None:
+                        state_input.update({
+                            "project_tree": session_cache["project_tree"],
+                            "active_skills": session_cache["active_skills"],
+                            "project_rules": session_cache["project_rules"],
+                        })
+                        
+                    async for event in agent.astream_events(
+                        state_input,
+                        version="v2",
+                    ):
+                        event_type = event.get("event")
+                        
+                        if event_type == "on_chain_start":
+                            metadata = event.get("metadata", {})
+                            name = event.get("name", "")
+                            if name and name not in ["RunnableSequence"]:
+                                pass
 
-                def clean_thought_blocks(text: str) -> str:
-                    # Remove anything inside <thought> tags (non-greedy)
-                    return re.sub(r'<thought>.*?</thought>', '', text, flags=re.DOTALL).strip()
-
-                from langchain_core.messages import AIMessageChunk
-                for mode, payload in agent.stream(
-                    {"messages": full_messages, "iteration_count": 0},
-                    stream_mode=["messages", "updates"],
-                ):
-                    if mode == "messages":
-                        chunk, metadata = payload
-                        if metadata.get("langgraph_node") in ["architect", "editor", "validator"] and isinstance(chunk, AIMessageChunk):
-                            if not chunk.tool_call_chunks and not chunk.tool_calls:
-                                content = chunk.content
-                                if isinstance(content, list):
-                                    content = "".join(
-                                        item.get("text", "") if isinstance(item, dict) else str(item)
-                                        for item in content
-                                    )
-                                if content:
-                                    final_response += content
-                                    
-                                    # Filter thoughts for display
-                                    display_text = clean_thought_blocks(final_response)
-                                    
-                                    if live_render is None:
-                                        console.print()
-                                        live_render = Live(
-                                            Panel(Markdown(display_text or "🧠 *Thinking...*"), title="[bold cyan]DevIn[/]", border_style="cyan", padding=(1, 2)),
-                                            console=console,
-                                            refresh_per_second=15,
-                                            transient=False,
-                                        )
-                                        live_render.start()
-                                    
-                                    live_render.update(Panel(Markdown(display_text or "🧠 *Thinking...*"), title="[bold cyan]DevIn[/]", border_style="cyan", padding=(1, 2)))
-
-                    elif mode == "updates":
-                        if live_render is not None:
-                            live_render.stop()
-                            live_render = None
-
-                        for node_name, state_update in payload.items():
-                            if node_name in ["architect", "editor", "validator"]:
-                                if node_name == "architect":
-                                    # We don't necessarily increment iteration for architect if we track total across graph,
-                                    # but let's just increment to show progress.
-                                    iteration += 1
-                                    
-                                messages = state_update.get("messages", [])
-                                for msg in messages:
-                                    if isinstance(msg, AIMessage):
-                                        if msg.tool_calls:
-                                            # Differentiate node thinking phases
-                                            if node_name == "architect":
-                                                console.print(f"\n[cyan]🧠 Architect Planning (Iteration {iteration})...[/]")
-                                            elif node_name == "validator":
-                                                console.print(f"\n[green]🔍 Validator Reviewing...[/]")
-                                            else:
-                                                console.print(f"\n[magenta]⚡ Editor Executing...[/]")
-                                                
-                                            for tc in msg.tool_calls:
-                                                print_tool_call(tc["name"], tc.get("args", {}))
+                        elif event_type == "on_chain_end":
+                            name = event.get("name", "")
                             
-                            elif node_name in ["architect_tools", "editor_tools"]:
-                                messages = state_update.get("messages", [])
-                                for msg in messages:
-                                    if isinstance(msg, ToolMessage):
-                                        c = msg.content if isinstance(msg.content, str) else str(msg.content)
-                                        print_tool_result(c)
+                            if name == "LangGraph":
+                                final_state = event.get("data", {}).get("output", {})
+                                if isinstance(final_state, dict):
+                                    if session_cache["project_tree"] is None:
+                                        session_cache["project_tree"] = final_state.get("project_tree", "")
+                                        session_cache["active_skills"] = final_state.get("active_skills", "")
+                                        session_cache["project_rules"] = final_state.get("project_rules", "")
+                                
+                                    if "messages" in final_state:
+                                        conversation = list(final_state["messages"])
+                                        if conversation:
+                                            last_msg = conversation[-1]
+                                            if hasattr(last_msg, "content") and last_msg.content:
+                                                already_rendered = True
+                                                interaction_logger.log("assistant", str(last_msg.content), {"iterations": iteration})
+                                                print_response(str(last_msg.content))
+                            
+                            if name and name not in ["RunnableSequence"]:
+                                pass
+
+                        elif event_type in ["on_chat_model_stream", "on_llm_stream"]:
+                            data = event.get("data", {})
+                            chunk = data.get("chunk")
+                            
+                            chunk_content = ""
+                            if chunk:
+                                if hasattr(chunk, "content"):
+                                    c = chunk.content
+                                    if isinstance(c, str):
+                                        chunk_content = c
+                                    elif isinstance(c, list):
+                                        for item in c:
+                                            if isinstance(item, dict) and "text" in item:
+                                                chunk_content += item["text"]
+                                            elif isinstance(item, str):
+                                                chunk_content += item
+                                elif isinstance(chunk, dict):
+                                    c = chunk.get("content", "")
+                                    if isinstance(c, str):
+                                        chunk_content = c
+                                    elif isinstance(c, list):
+                                        for item in c:
+                                            if isinstance(item, dict) and "text" in item:
+                                                chunk_content += item["text"]
+                                elif isinstance(chunk, str):
+                                    chunk_content = chunk
+                                    
+                            if chunk_content:
+                                final_response += chunk_content
+                                display_text = thought_buffer.add_chunk(chunk_content)
+                                
+                                if live_render is None and display_text:
+                                    console.print(f"  [cyan]🧠 Thinking...[/]")
+                                    live_render = True
+                                elif live_render is not None:
+                                    pass
+
+                        elif event_type == "on_tool_start":
+                            data = event.get("data", {})
+                            name = event.get("name", "")
+                            input_data = data.get("input", {})
+                            if name:
+                                if live_render is not None:
+                                    live_render = None
+                                    thought_buffer = ThoughtBuffer()
+                                iteration += 1
+                                print_tool_call(name, input_data)
+
+                        elif event_type == "on_tool_end":
+                            name = event.get("name", "")
+                            if name in ["RunnableSequence", "ToolNode", "editor_tools", "architect_tools"]:
+                                continue
+                            
+                            data = event.get("data", {})
+                            if "output" in data:
+                                output = data["output"]
+                                if isinstance(output, dict) and "messages" in output:
+                                    messages = output["messages"]
+                                    if messages and hasattr(messages[-1], 'content'):
+                                        print_tool_result(str(messages[-1].content))
+                                        continue
+                                        
+                                if hasattr(output, 'content'):
+                                    print_tool_result(str(output.content))
+                                elif isinstance(output, str):
+                                    print_tool_result(output)
+                                else:
+                                    print_tool_result(str(output))
+
+                except KeyboardInterrupt:
+                    if live_render is not None:
+                        live_render = None
+                    console.print("\n  [devin.system]⚡ Interrupted. Ready for next input.[/]\n")
+                    continue
 
                 if live_render is not None:
-                    live_render.stop()
+                    live_render = None
 
-                if final_response:
-                    conversation.append(AIMessage(content=final_response))
+                if not already_rendered and final_response:
                     interaction_logger.log("assistant", final_response, {"iterations": iteration})
-                else:
+                    print_response(final_response)
+                elif not already_rendered and not final_response:
                     print_error("Agent did not produce a response.")
 
             except KeyboardInterrupt:
@@ -392,6 +535,14 @@ def run_cli():
                 print_error(f"Agent error: {e}")
                 if debug_mode:
                     console.print_exception()
+                
+                if live_render is not None:
+                    live_render = None
+                
+                if conversation and isinstance(conversation[-1], HumanMessage):
+                    conversation.pop()
+                    
+                console.print("\n  [devin.system]⚠️ Graph execution crashed. State has been reset. Ready for next input.[/]\n")
                 continue
 
         except KeyboardInterrupt:
@@ -400,9 +551,11 @@ def run_cli():
 
 
 def main():
-    """Entry point for the `devin` command."""
-    run_cli()
+    """Legacy entry point. Delegates to the maintained CLI entry point."""
+    from devin.cli.main import main as cli_main
+    return cli_main()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+
