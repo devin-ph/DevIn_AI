@@ -61,5 +61,13 @@ Contributions are welcome! Please follow these guidelines:
 4. Push to branch (`git push origin feature/your-feature`)
 5. Open a pull request
 
+## Setup
+
+1. Clone repo.
+2. Copy `.env.example` to `.env` and add your API keys.
+3. Copy `src/devin/skills/WHO_YOU_ARE.example.md` to `src/devin/skills/WHO_YOU_ARE.md` and fill in your personal profile.
+4. Run: `pip install -r requirements.txt`
+5. Run: `python -m devin.main`
+
 ## License                            
 Distributed under the MIT License. See `LICENSE` file for details. 
