@@ -33,7 +33,6 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
     up-to-date facts, news, documentation, or any information you don't already know.
     Returns a summary of the top search results with source URLs."""
 
-    # Try Tavily first if configured (optional upgrade)
     try:
         from devin.settings import settings
 
@@ -42,7 +41,6 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
     except Exception as e:
         logger.debug(f"Tavily not available ({e}), using DuckDuckGo")
 
-    # Default: DuckDuckGo (free, no key needed)
     try:
         return _search_duckduckgo(query, max_results)
     except Exception as e:
@@ -77,11 +75,9 @@ def _search_tavily(query: str, max_results: int) -> str:
 
     results = []
 
-    # Include the AI-generated answer if available
     if response.get("answer"):
         results.append(f"**Summary:** {response['answer']}\n")
 
-    # Include individual results
     for i, result in enumerate(response.get("results", []), 1):
         title = result.get("title", "No title")
         url = result.get("url", "")

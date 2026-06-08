@@ -28,7 +28,6 @@ class CalculatorInput(BaseModel):
     )
 
 
-# Safe list of allowed names for evaluation
 _SAFE_MATH_NAMES: dict = {
     "sqrt": math.sqrt,
     "sin": math.sin,
